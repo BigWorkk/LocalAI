@@ -2,7 +2,7 @@ package schema
 
 import (
 	"context"
-	"time"
+	"encoding/json"
 
 	functions "github.com/mudler/LocalAI/pkg/functions"
 )
@@ -19,23 +19,59 @@ type ErrorResponse struct {
 	Error *APIError `json:"error,omitempty"`
 }
 
+type InputTokensDetails struct {
+	TextTokens  int `json:"text_tokens"`
+	ImageTokens int `json:"image_tokens"`
+}
+
 type OpenAIUsage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
 	TotalTokens      int `json:"total_tokens"`
+	// Fields for image generation API compatibility
+	InputTokens        int                 `json:"input_tokens,omitempty"`
+	OutputTokens       int                 `json:"output_tokens,omitempty"`
+	InputTokensDetails *InputTokensDetails `json:"input_tokens_details,omitempty"`
 	// Extra timing data, disabled by default as is't not a part of OpenAI specification
 	TimingPromptProcessing float64 `json:"timing_prompt_processing,omitempty"`
 	TimingTokenGeneration  float64 `json:"timing_token_generation,omitempty"`
 }
 
 type Item struct {
-	Embedding []float32 `json:"embedding"`
-	Index     int       `json:"index"`
-	Object    string    `json:"object,omitempty"`
+	Embedding       []float32 `json:"-"`
+	EmbeddingBase64 string    `json:"-"`
+	Index           int       `json:"index"`
+	Object          string    `json:"object,omitempty"`
 
 	// Images
 	URL     string `json:"url,omitempty"`
 	B64JSON string `json:"b64_json,omitempty"`
+}
+
+// MarshalJSON serialises Item so that the "embedding" field is either a float array
+// or a base64 string depending on which field is populated.  This satisfies the
+// OpenAI API encoding_format contract: the Node.js SDK (v4+) sends
+// encoding_format=base64 by default and expects a base64 string back.
+func (item Item) MarshalJSON() ([]byte, error) {
+	type itemFields struct {
+		Embedding any    `json:"embedding,omitempty"`
+		Index     int    `json:"index"`
+		Object    string `json:"object,omitempty"`
+		URL       string `json:"url,omitempty"`
+		B64JSON   string `json:"b64_json,omitempty"`
+	}
+	f := itemFields{
+		Index:   item.Index,
+		Object:  item.Object,
+		URL:     item.URL,
+		B64JSON: item.B64JSON,
+	}
+	if item.EmbeddingBase64 != "" {
+		f.Embedding = item.EmbeddingBase64
+	} else {
+		f.Embedding = item.Embedding
+	}
+	return json.Marshal(f)
 }
 
 type OpenAIResponse struct {
@@ -50,56 +86,44 @@ type OpenAIResponse struct {
 }
 
 type Choice struct {
-	Index        int      `json:"index"`
-	FinishReason string   `json:"finish_reason"`
-	Message      *Message `json:"message,omitempty"`
-	Delta        *Message `json:"delta,omitempty"`
-	Text         string   `json:"text,omitempty"`
+	Index        int       `json:"index"`
+	FinishReason *string   `json:"finish_reason"`
+	Message      *Message  `json:"message,omitempty"`
+	Delta        *Message  `json:"delta,omitempty"`
+	Text         string    `json:"text,omitempty"`
+	Logprobs     *Logprobs `json:"logprobs,omitempty"`
+}
+
+type Logprobs struct {
+	Content []LogprobContent `json:"content,omitempty"`
+}
+
+type LogprobContent struct {
+	ID          int32            `json:"id"`
+	Token       string           `json:"token"`
+	Bytes       []int            `json:"bytes,omitempty"`
+	Logprob     float64          `json:"logprob"`
+	TopLogprobs []LogprobContent `json:"top_logprobs,omitempty"`
 }
 
 type Content struct {
-	Type     string     `json:"type" yaml:"type"`
-	Text     string     `json:"text" yaml:"text"`
-	ImageURL ContentURL `json:"image_url" yaml:"image_url"`
-	AudioURL ContentURL `json:"audio_url" yaml:"audio_url"`
-	VideoURL ContentURL `json:"video_url" yaml:"video_url"`
+	Type       string     `json:"type" yaml:"type"`
+	Text       string     `json:"text" yaml:"text"`
+	ImageURL   ContentURL `json:"image_url" yaml:"image_url"`
+	AudioURL   ContentURL `json:"audio_url" yaml:"audio_url"`
+	VideoURL   ContentURL `json:"video_url" yaml:"video_url"`
+	InputAudio InputAudio `json:"input_audio" yaml:"input_audio"`
 }
 
 type ContentURL struct {
 	URL string `json:"url" yaml:"url"`
 }
 
-type Message struct {
-	// The message role
-	Role string `json:"role,omitempty" yaml:"role"`
-
-	// The message name (used for tools calls)
-	Name string `json:"name,omitempty" yaml:"name"`
-
-	// The message content
-	Content interface{} `json:"content" yaml:"content"`
-
-	StringContent string   `json:"string_content,omitempty" yaml:"string_content,omitempty"`
-	StringImages  []string `json:"string_images,omitempty" yaml:"string_images,omitempty"`
-	StringVideos  []string `json:"string_videos,omitempty" yaml:"string_videos,omitempty"`
-	StringAudios  []string `json:"string_audios,omitempty" yaml:"string_audios,omitempty"`
-
-	// A result of a function call
-	FunctionCall interface{} `json:"function_call,omitempty" yaml:"function_call,omitempty"`
-
-	ToolCalls []ToolCall `json:"tool_calls,omitempty" yaml:"tool_call,omitempty"`
-}
-
-type ToolCall struct {
-	Index        int          `json:"index"`
-	ID           string       `json:"id"`
-	Type         string       `json:"type"`
-	FunctionCall FunctionCall `json:"function"`
-}
-
-type FunctionCall struct {
-	Name      string `json:"name,omitempty"`
-	Arguments string `json:"arguments"`
+type InputAudio struct {
+	// Format identifies the audio format, e.g. 'wav'.
+	Format string `json:"format" yaml:"format"`
+	// Data holds the base64-encoded audio data.
+	Data string `json:"data" yaml:"data"`
 }
 
 type OpenAIModel struct {
@@ -107,40 +131,20 @@ type OpenAIModel struct {
 	Object string `json:"object"`
 }
 
-type DeleteAssistantResponse struct {
-	ID      string `json:"id"`
-	Object  string `json:"object"`
-	Deleted bool   `json:"deleted"`
-}
-
-// File represents the structure of a file object from the OpenAI API.
-type File struct {
-	ID        string    `json:"id"`         // Unique identifier for the file
-	Object    string    `json:"object"`     // Type of the object (e.g., "file")
-	Bytes     int       `json:"bytes"`      // Size of the file in bytes
-	CreatedAt time.Time `json:"created_at"` // The time at which the file was created
-	Filename  string    `json:"filename"`   // The name of the file
-	Purpose   string    `json:"purpose"`    // The purpose of the file (e.g., "fine-tune", "classifications", etc.)
-}
-
-type ListFiles struct {
-	Data   []File
-	Object string
-}
-
-type AssistantFileRequest struct {
-	FileID string `json:"file_id"`
-}
-
-type DeleteAssistantFileResponse struct {
-	ID      string `json:"id"`
-	Object  string `json:"object"`
-	Deleted bool   `json:"deleted"`
-}
-
 type ImageGenerationResponseFormat string
 
 type ChatCompletionResponseFormatType string
+
+type TranscriptionResponseFormatType string
+
+const (
+	TranscriptionResponseFormatText        = TranscriptionResponseFormatType("txt")
+	TranscriptionResponseFormatSrt         = TranscriptionResponseFormatType("srt")
+	TranscriptionResponseFormatVtt         = TranscriptionResponseFormatType("vtt")
+	TranscriptionResponseFormatLrc         = TranscriptionResponseFormatType("lrc")
+	TranscriptionResponseFormatJson        = TranscriptionResponseFormatType("json")
+	TranscriptionResponseFormatJsonVerbose = TranscriptionResponseFormatType("verbose_json")
+)
 
 type ChatCompletionResponseFormat struct {
 	Type ChatCompletionResponseFormatType `json:"type,omitempty"`
@@ -165,33 +169,36 @@ type OpenAIRequest struct {
 
 	// whisper
 	File string `json:"file" validate:"required"`
+	// Multiple input images for img2img or inpainting
+	Files []string `json:"files,omitempty"`
+	// Reference images for models that support them (e.g., Flux Kontext)
+	RefImages []string `json:"ref_images,omitempty"`
 	//whisper/image
-	ResponseFormat interface{} `json:"response_format,omitempty"`
+	ResponseFormat any `json:"response_format,omitempty"`
 	// image
 	Size string `json:"size"`
 	// Prompt is read only by completion/image API calls
-	Prompt interface{} `json:"prompt" yaml:"prompt"`
+	Prompt any `json:"prompt" yaml:"prompt"`
 
 	// Edit endpoint
-	Instruction string      `json:"instruction" yaml:"instruction"`
-	Input       interface{} `json:"input" yaml:"input"`
+	Instruction string `json:"instruction" yaml:"instruction"`
+	Input       any    `json:"input" yaml:"input"`
 
-	Stop interface{} `json:"stop" yaml:"stop"`
+	Stop any `json:"stop" yaml:"stop"`
 
 	// Messages is read only by chat/completion API calls
 	Messages []Message `json:"messages" yaml:"messages"`
 
 	// A list of available functions to call
 	Functions    functions.Functions `json:"functions" yaml:"functions"`
-	FunctionCall interface{}         `json:"function_call" yaml:"function_call"` // might be a string or an object
+	FunctionCall any                 `json:"function_call" yaml:"function_call"` // might be a string or an object
 
 	Tools       []functions.Tool `json:"tools,omitempty" yaml:"tools"`
-	ToolsChoice interface{}      `json:"tool_choice,omitempty" yaml:"tool_choice"`
+	ToolsChoice any              `json:"tool_choice,omitempty" yaml:"tool_choice"`
 
 	Stream bool `json:"stream"`
 
 	// Image (not supported by OpenAI)
-	Mode    int    `json:"mode"`
 	Quality string `json:"quality"`
 	Step    int    `json:"step"`
 
@@ -203,6 +210,10 @@ type OpenAIRequest struct {
 	Backend string `json:"backend" yaml:"backend"`
 
 	ModelBaseName string `json:"model_base_name" yaml:"model_base_name"`
+
+	ReasoningEffort string `json:"reasoning_effort" yaml:"reasoning_effort"`
+
+	Metadata map[string]string `json:"metadata" yaml:"metadata"`
 }
 
 type ModelsDataResponse struct {

@@ -1,49 +1,21 @@
+# Disable parallel execution for backend builds
+.NOTPARALLEL: backends/diffusers backends/llama-cpp backends/turboquant backends/outetts backends/piper backends/stablediffusion-ggml backends/whisper backends/faster-whisper backends/silero-vad backends/local-store backends/huggingface backends/rfdetr backends/insightface backends/speaker-recognition backends/kitten-tts backends/kokoro backends/chatterbox backends/llama-cpp-darwin backends/neutts build-darwin-python-backend build-darwin-go-backend backends/mlx backends/diffuser-darwin backends/mlx-vlm backends/mlx-audio backends/mlx-distributed backends/stablediffusion-ggml-darwin backends/vllm backends/vllm-omni backends/sglang backends/moonshine backends/pocket-tts backends/qwen-tts backends/faster-qwen3-tts backends/qwen-asr backends/nemo backends/voxcpm backends/whisperx backends/ace-step backends/acestep-cpp backends/fish-speech backends/voxtral backends/opus backends/trl backends/llama-cpp-quantization backends/kokoros backends/sam3-cpp backends/qwen3-tts-cpp backends/vibevoice-cpp backends/tinygrad backends/sherpa-onnx
+
 GOCMD=go
 GOTEST=$(GOCMD) test
 GOVET=$(GOCMD) vet
 BINARY_NAME=local-ai
+LAUNCHER_BINARY_NAME=local-ai-launcher
 
-DETECT_LIBS?=true
+UBUNTU_VERSION?=2404
+UBUNTU_CODENAME?=noble
 
-# llama.cpp versions
-CPPLLAMA_VERSION?=8a1d206f1d2b4e45918b589f3165b4be232f7ba8
-
-# whisper.cpp version
-WHISPER_REPO?=https://github.com/ggml-org/whisper.cpp
-WHISPER_CPP_VERSION?=78b31ca7824500e429ba026c1a9b48e0b41c50cb
-
-# go-piper version
-PIPER_REPO?=https://github.com/mudler/go-piper
-PIPER_VERSION?=e10ca041a885d4a8f3871d52924b47792d5e5aa0
-
-# bark.cpp
-BARKCPP_REPO?=https://github.com/PABannier/bark.cpp.git
-BARKCPP_VERSION?=v1.0.0
-
-# stablediffusion.cpp (ggml)
-STABLEDIFFUSION_GGML_REPO?=https://github.com/richiejp/stable-diffusion.cpp
-STABLEDIFFUSION_GGML_VERSION?=53e3b17eb3d0b5760ced06a1f98320b68b34aaae
-
-# ONEAPI variables for SYCL
-export ONEAPI_VARS?=/opt/intel/oneapi/setvars.sh
-
-ONNX_VERSION?=1.20.0
-ONNX_ARCH?=x64
-ONNX_OS?=linux
+GORELEASER?=
 
 export BUILD_TYPE?=
-export STABLE_BUILD_TYPE?=$(BUILD_TYPE)
-export CMAKE_ARGS?=-DBUILD_SHARED_LIBS=OFF
-export WHISPER_CMAKE_ARGS?=-DBUILD_SHARED_LIBS=OFF
-export BACKEND_LIBS?=
-export WHISPER_DIR=$(abspath ./sources/whisper.cpp)
-export WHISPER_INCLUDE_PATH=$(WHISPER_DIR)/include:$(WHISPER_DIR)/ggml/include
-export WHISPER_LIBRARY_PATH=$(WHISPER_DIR)/build/src/:$(WHISPER_DIR)/build/ggml/src
+export CUDA_MAJOR_VERSION?=13
+export CUDA_MINOR_VERSION?=0
 
-CGO_LDFLAGS?=
-CGO_LDFLAGS_WHISPER?=
-CGO_LDFLAGS_WHISPER+=-lggml
-CUDA_LIBPATH?=/usr/local/cuda/lib64/
 GO_TAGS?=
 BUILD_ID?=
 NATIVE?=false
@@ -70,14 +42,6 @@ WHITE  := $(shell tput -Txterm setaf 7)
 CYAN   := $(shell tput -Txterm setaf 6)
 RESET  := $(shell tput -Txterm sgr0)
 
-UPX?=
-# check if upx exists
-ifeq (, $(shell which upx))
-	UPX=
-else
-	UPX=$(shell which upx)
-endif
-
 # Default Docker bridge IP
 E2E_BRIDGE_IP?=172.17.0.1
 
@@ -85,439 +49,303 @@ ifndef UNAME_S
 UNAME_S := $(shell uname -s)
 endif
 
-# IF native is false, we add -DGGML_NATIVE=OFF to CMAKE_ARGS
-ifeq ($(NATIVE),false)
-	CMAKE_ARGS+=-DGGML_NATIVE=OFF
-	WHISPER_CMAKE_ARGS+=-DGGML_NATIVE=OFF
-endif
-
-# Detect if we are running on arm64
-ifneq (,$(findstring aarch64,$(shell uname -m)))
-	ONNX_ARCH=aarch64
-endif
-
 ifeq ($(OS),Darwin)
-	ONNX_OS=osx
-	ifneq (,$(findstring aarch64,$(shell uname -m)))
-		ONNX_ARCH=arm64
-	else ifneq (,$(findstring arm64,$(shell uname -m)))
-		ONNX_ARCH=arm64
-	else
-		ONNX_ARCH=x86_64
-	endif
-
 	ifeq ($(OSX_SIGNING_IDENTITY),)
 		OSX_SIGNING_IDENTITY := $(shell security find-identity -v -p codesigning | grep '"' | head -n 1 | sed -E 's/.*"(.*)"/\1/')
 	endif
+endif
 
-	# on OSX, if BUILD_TYPE is blank, we should default to use Metal
-	ifeq ($(BUILD_TYPE),)
-		BUILD_TYPE=metal
-	# disable metal if on Darwin and any other value is explicitly passed.
-	else ifneq ($(BUILD_TYPE),metal)
-		CMAKE_ARGS+=-DGGML_METAL=OFF
-		WHISPER_CMAKE_ARGS+=-DGGML_METAL=OFF
-		export GGML_NO_ACCELERATE=1
-		export GGML_NO_METAL=1
-		GO_LDFLAGS_WHISPER+=-lggml-blas
-		export WHISPER_LIBRARY_PATH:=$(WHISPER_LIBRARY_PATH):$(WHISPER_DIR)/build/ggml/src/ggml-blas
-	endif
-
-	ifeq ($(BUILD_TYPE),metal)
-		CGO_LDFLAGS += -framework Accelerate
-		CGO_LDFLAGS_WHISPER+=-lggml-metal -lggml-blas
-		CMAKE_ARGS+=-DGGML_METAL=ON
-		CMAKE_ARGS+=-DGGML_METAL_USE_BF16=ON
-		CMAKE_ARGS+=-DGGML_METAL_EMBED_LIBRARY=ON
-		CMAKE_ARGS+=-DGGML_OPENMP=OFF
-		WHISPER_CMAKE_ARGS+=-DGGML_METAL=ON
-		WHISPER_CMAKE_ARGS+=-DGGML_METAL_USE_BF16=ON
-		WHISPER_CMAKE_ARGS+=-DGGML_METAL_EMBED_LIBRARY=ON
-		WHISPER_CMAKE_ARGS+=-DWHISPER_BUILD_EXAMPLES=OFF
-		WHISPER_CMAKE_ARGS+=-DWHISPER_BUILD_TESTS=OFF
-		WHISPER_CMAKE_ARGS+=-DWHISPER_BUILD_SERVER=OFF
-		WHISPER_CMAKE_ARGS+=-DGGML_OPENMP=OFF
-		export WHISPER_LIBRARY_PATH:=$(WHISPER_LIBRARY_PATH):$(WHISPER_DIR)/build/ggml/src/ggml-metal/:$(WHISPER_DIR)/build/ggml/src/ggml-blas
-	else
-		CGO_LDFLAGS_WHISPER+=-lggml-blas
-		export WHISPER_LIBRARY_PATH:=$(WHISPER_LIBRARY_PATH):$(WHISPER_DIR)/build/ggml/src/ggml-blas
-	endif
+# check if goreleaser exists
+ifeq (, $(shell which goreleaser))
+	GORELEASER=curl -sfL https://goreleaser.com/static/run | bash -s --
 else
-CGO_LDFLAGS_WHISPER+=-lgomp
+	GORELEASER=$(shell which goreleaser)
 endif
 
-ifeq ($(BUILD_TYPE),openblas)
-	CGO_LDFLAGS+=-lopenblas
-	export GGML_OPENBLAS=1
-endif
-
-ifeq ($(BUILD_TYPE),cublas)
-	CGO_LDFLAGS+=-lcublas -lcudart -L$(CUDA_LIBPATH) -L$(CUDA_LIBPATH)/stubs/ -lcuda
-	export GGML_CUDA=1
-	CMAKE_ARGS+=-DGGML_CUDA=ON
-	WHISPER_CMAKE_ARGS+=-DGGML_CUDA=ON
-	CGO_LDFLAGS_WHISPER+=-lcufft -lggml-cuda
-	export WHISPER_LIBRARY_PATH:=$(WHISPER_LIBRARY_PATH):$(WHISPER_DIR)/build/ggml/src/ggml-cuda/
-endif
-
-ifeq ($(BUILD_TYPE),vulkan)
-	CMAKE_ARGS+=-DGGML_VULKAN=1
-	WHISPER_CMAKE_ARGS+=-DGGML_VULKAN=1
-	CGO_LDFLAGS_WHISPER+=-lggml-vulkan -lvulkan
-	export WHISPER_LIBRARY_PATH:=$(WHISPER_LIBRARY_PATH):$(WHISPER_DIR)/build/ggml/src/ggml-vulkan/
-endif
-
-ifneq (,$(findstring sycl,$(BUILD_TYPE)))
-	export GGML_SYCL=1
-	CMAKE_ARGS+=-DGGML_SYCL=ON
-endif
-
-ifeq ($(BUILD_TYPE),sycl_f16)
-	export GGML_SYCL_F16=1
-	CMAKE_ARGS+=-DGGML_SYCL_F16=ON
-endif
-
-ifeq ($(BUILD_TYPE),hipblas)
-	ROCM_HOME ?= /opt/rocm
-	ROCM_PATH ?= /opt/rocm
-	LD_LIBRARY_PATH ?= /opt/rocm/lib:/opt/rocm/llvm/lib
-	export CXX=$(ROCM_HOME)/llvm/bin/clang++
-	export CC=$(ROCM_HOME)/llvm/bin/clang
-	export STABLE_BUILD_TYPE=
-	export GGML_HIP=1
-	GPU_TARGETS ?= gfx803,gfx900,gfx906,gfx908,gfx90a,gfx942,gfx1010,gfx1030,gfx1032,gfx1100,gfx1101,gfx1102
-	AMDGPU_TARGETS ?= "$(GPU_TARGETS)"
-	CMAKE_ARGS+=-DGGML_HIP=ON -DAMDGPU_TARGETS="$(AMDGPU_TARGETS)" -DGPU_TARGETS="$(GPU_TARGETS)"
-	CGO_LDFLAGS += -O3 --rtlib=compiler-rt -unwindlib=libgcc -lhipblas -lrocblas --hip-link -L${ROCM_HOME}/lib/llvm/lib
-endif
-
-ifeq ($(BUILD_TYPE),metal)
-	CGO_LDFLAGS+=-framework Foundation -framework Metal -framework MetalKit -framework MetalPerformanceShaders
-	export GGML_METAL=1
-endif
-
-ifeq ($(BUILD_TYPE),clblas)
-	CGO_LDFLAGS+=-lOpenCL -lclblast
-	export GGML_OPENBLAS=1
-endif
-
-# glibc-static or glibc-devel-static required
-ifeq ($(STATIC),true)
-	LD_FLAGS+=-linkmode external -extldflags -static
-endif
-
-ifeq ($(findstring tts,$(GO_TAGS)),tts)
-#	OPTIONAL_TARGETS+=go-piper/libpiper_binding.a
-#	OPTIONAL_TARGETS+=backend-assets/espeak-ng-data
-	PIPER_CGO_CXXFLAGS+=-I$(CURDIR)/sources/go-piper/piper/src/cpp -I$(CURDIR)/sources/go-piper/piper/build/fi/include -I$(CURDIR)/sources/go-piper/piper/build/pi/include -I$(CURDIR)/sources/go-piper/piper/build/si/include
-	PIPER_CGO_LDFLAGS+=-L$(CURDIR)/sources/go-piper/piper/build/fi/lib -L$(CURDIR)/sources/go-piper/piper/build/pi/lib -L$(CURDIR)/sources/go-piper/piper/build/si/lib -lfmt -lspdlog -lucd
-	OPTIONAL_GRPC+=backend-assets/grpc/piper
-endif
-
-ALL_GRPC_BACKENDS=backend-assets/grpc/huggingface
-ALL_GRPC_BACKENDS+=backend-assets/grpc/llama-cpp-avx
-ALL_GRPC_BACKENDS+=backend-assets/grpc/llama-cpp-avx2
-ALL_GRPC_BACKENDS+=backend-assets/grpc/llama-cpp-avx512
-ALL_GRPC_BACKENDS+=backend-assets/grpc/llama-cpp-fallback
-ALL_GRPC_BACKENDS+=backend-assets/grpc/llama-cpp-grpc
-ALL_GRPC_BACKENDS+=backend-assets/util/llama-cpp-rpc-server
-ALL_GRPC_BACKENDS+=backend-assets/grpc/whisper
-
-ifeq ($(ONNX_OS),linux)
-ifeq ($(ONNX_ARCH),x64)
-	ALL_GRPC_BACKENDS+=backend-assets/grpc/bark-cpp
-	ALL_GRPC_BACKENDS+=backend-assets/grpc/stablediffusion-ggml
-endif
-endif
-
-ALL_GRPC_BACKENDS+=backend-assets/grpc/local-store
-ALL_GRPC_BACKENDS+=backend-assets/grpc/silero-vad
-ALL_GRPC_BACKENDS+=$(OPTIONAL_GRPC)
-# Use filter-out to remove the specified backends
-ALL_GRPC_BACKENDS := $(filter-out $(SKIP_GRPC_BACKEND),$(ALL_GRPC_BACKENDS))
-
-GRPC_BACKENDS?=$(ALL_GRPC_BACKENDS) $(OPTIONAL_GRPC)
 TEST_PATHS?=./api/... ./pkg/... ./core/...
 
-# If empty, then we build all
-ifeq ($(GRPC_BACKENDS),)
-	GRPC_BACKENDS=$(ALL_GRPC_BACKENDS)
-endif
 
-ifeq ($(BUILD_API_ONLY),true)
-	GRPC_BACKENDS=
-endif
-
-.PHONY: all test build vendor get-sources prepare-sources prepare
+.PHONY: all test build vendor lint lint-all
 
 all: help
-
-## bark.cpp
-sources/bark.cpp:
-	git clone --recursive $(BARKCPP_REPO) sources/bark.cpp && \
-	cd sources/bark.cpp && \
-	git checkout $(BARKCPP_VERSION) && \
-	git submodule update --init --recursive --depth 1 --single-branch
-
-sources/bark.cpp/build/libbark.a: sources/bark.cpp
-	cd sources/bark.cpp && \
-	mkdir -p build && \
-	cd build && \
-	cmake $(CMAKE_ARGS) .. && \
-	cmake --build . --config Release
-
-backend/go/bark/libbark.a: sources/bark.cpp/build/libbark.a
-	$(MAKE) -C backend/go/bark libbark.a
-
-## go-piper
-sources/go-piper:
-	mkdir -p sources/go-piper
-	cd sources/go-piper && \
-	git init && \
-	git remote add origin $(PIPER_REPO) && \
-	git fetch origin && \
-	git checkout $(PIPER_VERSION) && \
-	git submodule update --init --recursive --depth 1 --single-branch
-
-sources/go-piper/libpiper_binding.a: sources/go-piper
-	$(MAKE) -C sources/go-piper libpiper_binding.a example/main piper.o
-
-## stablediffusion (ggml)
-sources/stablediffusion-ggml.cpp:
-	git clone --recursive $(STABLEDIFFUSION_GGML_REPO) sources/stablediffusion-ggml.cpp && \
-	cd sources/stablediffusion-ggml.cpp && \
-	git checkout $(STABLEDIFFUSION_GGML_VERSION) && \
-	git submodule update --init --recursive --depth 1 --single-branch
-
-backend/go/image/stablediffusion-ggml/libsd.a: sources/stablediffusion-ggml.cpp
-	$(MAKE) -C backend/go/image/stablediffusion-ggml build/libstable-diffusion.a
-	$(MAKE) -C backend/go/image/stablediffusion-ggml libsd.a
-
-backend-assets/grpc/stablediffusion-ggml: backend/go/image/stablediffusion-ggml/libsd.a backend-assets/grpc
-	$(MAKE) -C backend/go/image/stablediffusion-ggml CGO_LDFLAGS="$(CGO_LDFLAGS)" stablediffusion-ggml
-
-sources/onnxruntime:
-	mkdir -p sources/onnxruntime
-	curl -L https://github.com/microsoft/onnxruntime/releases/download/v$(ONNX_VERSION)/onnxruntime-$(ONNX_OS)-$(ONNX_ARCH)-$(ONNX_VERSION).tgz -o sources/onnxruntime/onnxruntime-$(ONNX_OS)-$(ONNX_ARCH)-$(ONNX_VERSION).tgz
-	cd sources/onnxruntime && tar -xvf onnxruntime-$(ONNX_OS)-$(ONNX_ARCH)-$(ONNX_VERSION).tgz && rm onnxruntime-$(ONNX_OS)-$(ONNX_ARCH)-$(ONNX_VERSION).tgz
-	cd sources/onnxruntime && mv onnxruntime-$(ONNX_OS)-$(ONNX_ARCH)-$(ONNX_VERSION)/* ./
-
-backend-assets/lib/libonnxruntime.so.1: backend-assets/lib sources/onnxruntime
-	cp -rfv sources/onnxruntime/lib/* backend-assets/lib/
-ifeq ($(OS),Darwin)
-	mv backend-assets/lib/libonnxruntime.$(ONNX_VERSION).dylib backend-assets/lib/libonnxruntime.dylib
-else
-	mv backend-assets/lib/libonnxruntime.so.$(ONNX_VERSION) backend-assets/lib/libonnxruntime.so.1
-endif
-
-## whisper
-sources/whisper.cpp:
-	mkdir -p sources/whisper.cpp
-	cd sources/whisper.cpp && \
-	git init && \
-	git remote add origin $(WHISPER_REPO) && \
-	git fetch origin && \
-	git checkout $(WHISPER_CPP_VERSION) && \
-	git submodule update --init --recursive --depth 1 --single-branch
-
-sources/whisper.cpp/build/src/libwhisper.a: sources/whisper.cpp
-	cd sources/whisper.cpp && cmake $(WHISPER_CMAKE_ARGS) . -B ./build
-	cd sources/whisper.cpp/build && cmake --build . --config Release
-
-get-sources: sources/go-piper sources/stablediffusion-ggml.cpp sources/bark.cpp sources/whisper.cpp backend/cpp/llama/llama.cpp
-
-replace:
-	$(GOCMD) mod edit -replace github.com/ggerganov/whisper.cpp=$(CURDIR)/sources/whisper.cpp
-	$(GOCMD) mod edit -replace github.com/ggerganov/whisper.cpp/bindings/go=$(CURDIR)/sources/whisper.cpp/bindings/go
-	$(GOCMD) mod edit -replace github.com/mudler/go-piper=$(CURDIR)/sources/go-piper
-
-dropreplace:
-	$(GOCMD) mod edit -dropreplace github.com/ggerganov/whisper.cpp
-	$(GOCMD) mod edit -dropreplace github.com/ggerganov/whisper.cpp/bindings/go
-	$(GOCMD) mod edit -dropreplace github.com/mudler/go-piper
-
-prepare-sources: get-sources replace
-	$(GOCMD) mod download
 
 ## GENERIC
 rebuild: ## Rebuilds the project
 	$(GOCMD) clean -cache
-	$(MAKE) -C sources/whisper.cpp clean
-	$(MAKE) -C sources/go-piper clean
 	$(MAKE) build
-
-prepare: prepare-sources $(OPTIONAL_TARGETS)
 
 clean: ## Remove build related file
 	$(GOCMD) clean -cache
 	rm -f prepare
-	rm -rf ./sources
 	rm -rf $(BINARY_NAME)
 	rm -rf release/
-	rm -rf backend-assets/*
-	$(MAKE) -C backend/cpp/grpc clean
-	$(MAKE) -C backend/go/bark clean
-	$(MAKE) -C backend/cpp/llama clean
-	$(MAKE) -C backend/go/image/stablediffusion-ggml clean
-	rm -rf backend/cpp/llama-* || true
-	$(MAKE) dropreplace
 	$(MAKE) protogen-clean
 	rmdir pkg/grpc/proto || true
 
 clean-tests:
 	rm -rf test-models
 	rm -rf test-dir
-	rm -rf core/http/backend-assets
-
-clean-dc: clean
-	cp -r /build/backend-assets /workspace/backend-assets
+	rm -f tests/e2e/mock-backend/mock-backend
 
 ## Install Go tools
 install-go-tools:
 	go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@1958fcbe2ca8bd93af633f11e97d44e567e945af
 	go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.34.2
-	go install github.com/GeertJohan/go.rice/rice@latest
+
+## React UI:
+react-ui:
+ifneq ($(wildcard core/http/react-ui/dist),)
+	@echo "react-ui dist already exists, skipping build"
+else
+	cd core/http/react-ui && npm install && npm run build
+endif
+
+react-ui-docker:
+	docker run --entrypoint /bin/bash -v $(CURDIR):/app:z oven/bun:1 \
+	  -c "cd /app/core/http/react-ui && bun install && bun run build"
+
+core/http/react-ui/dist: react-ui
 
 ## Build:
-build: prepare backend-assets grpcs install-go-tools ## Build the project
+
+build: protogen-go generate install-go-tools core/http/react-ui/dist ## Build the project
 	$(info ${GREEN}I local-ai build info:${RESET})
 	$(info ${GREEN}I BUILD_TYPE: ${YELLOW}$(BUILD_TYPE)${RESET})
 	$(info ${GREEN}I GO_TAGS: ${YELLOW}$(GO_TAGS)${RESET})
 	$(info ${GREEN}I LD_FLAGS: ${YELLOW}$(LD_FLAGS)${RESET})
 	$(info ${GREEN}I UPX: ${YELLOW}$(UPX)${RESET})
-ifneq ($(BACKEND_LIBS),)
-	$(MAKE) backend-assets/lib
-	cp -f $(BACKEND_LIBS) backend-assets/lib/
-endif
 	rm -rf $(BINARY_NAME) || true
-	CGO_LDFLAGS="$(CGO_LDFLAGS)" $(GOCMD) build -ldflags "$(LD_FLAGS)" -tags "$(GO_TAGS)" -o $(BINARY_NAME) ./
-	rice append --exec $(BINARY_NAME)
+	CGO_LDFLAGS="$(CGO_LDFLAGS)" $(GOCMD) build -ldflags "$(LD_FLAGS)" -tags "$(GO_TAGS)" -o $(BINARY_NAME) ./cmd/local-ai
 
-build-minimal:
-	BUILD_GRPC_FOR_BACKEND_LLAMA=true GRPC_BACKENDS="backend-assets/grpc/llama-cpp-avx2" GO_TAGS=p2p $(MAKE) build
+build-launcher: ## Build the launcher application
+	$(info ${GREEN}I local-ai launcher build info:${RESET})
+	$(info ${GREEN}I BUILD_TYPE: ${YELLOW}$(BUILD_TYPE)${RESET})
+	$(info ${GREEN}I GO_TAGS: ${YELLOW}$(GO_TAGS)${RESET})
+	$(info ${GREEN}I LD_FLAGS: ${YELLOW}$(LD_FLAGS)${RESET})
+	rm -rf $(LAUNCHER_BINARY_NAME) || true
+	CGO_LDFLAGS="$(CGO_LDFLAGS)" $(GOCMD) build -ldflags "$(LD_FLAGS)" -tags "$(GO_TAGS)" -o $(LAUNCHER_BINARY_NAME) ./cmd/launcher
 
-build-api:
-	BUILD_GRPC_FOR_BACKEND_LLAMA=true BUILD_API_ONLY=true GO_TAGS=p2p $(MAKE) build
+build-all: build build-launcher ## Build both server and launcher
 
-backend-assets/lib:
-	mkdir -p backend-assets/lib
+build-dev: ## Run LocalAI in dev mode with live reload
+	@command -v air >/dev/null 2>&1 || go install github.com/air-verse/air@latest
+	air -c .air.toml
+
+dev-dist:
+	$(GORELEASER) build --snapshot --clean
 
 dist:
-	$(MAKE) backend-assets/grpc/llama-cpp-avx2
-ifeq ($(DETECT_LIBS),true)
-	scripts/prepare-libs.sh backend-assets/grpc/llama-cpp-avx2
-endif
-ifeq ($(OS),Darwin)
-	BUILD_TYPE=none $(MAKE) backend-assets/grpc/llama-cpp-fallback
-else
-	$(MAKE) backend-assets/grpc/llama-cpp-cuda
-	$(MAKE) backend-assets/grpc/llama-cpp-hipblas
-	$(MAKE) backend-assets/grpc/llama-cpp-sycl_f16
-	$(MAKE) backend-assets/grpc/llama-cpp-sycl_f32
-endif
-	GO_TAGS="tts p2p" $(MAKE) build
-ifeq ($(DETECT_LIBS),true)
-	scripts/prepare-libs.sh backend-assets/grpc/piper
-endif
-	GO_TAGS="tts p2p" STATIC=true $(MAKE) build
-	mkdir -p release
-# if BUILD_ID is empty, then we don't append it to the binary name
-ifeq ($(BUILD_ID),)
-	cp $(BINARY_NAME) release/$(BINARY_NAME)-$(OS)-$(ARCH)
-	shasum -a 256 release/$(BINARY_NAME)-$(OS)-$(ARCH) > release/$(BINARY_NAME)-$(OS)-$(ARCH).sha256
-else
-	cp $(BINARY_NAME) release/$(BINARY_NAME)-$(BUILD_ID)-$(OS)-$(ARCH)
-	shasum -a 256 release/$(BINARY_NAME)-$(BUILD_ID)-$(OS)-$(ARCH) > release/$(BINARY_NAME)-$(BUILD_ID)-$(OS)-$(ARCH).sha256
-endif
-
-dist-cross-linux-arm64:
-	CMAKE_ARGS="$(CMAKE_ARGS) -DGGML_NATIVE=off" GRPC_BACKENDS="backend-assets/grpc/llama-cpp-fallback backend-assets/grpc/llama-cpp-grpc backend-assets/util/llama-cpp-rpc-server" GO_TAGS="p2p" \
-	STATIC=true $(MAKE) build
-	mkdir -p release
-# if BUILD_ID is empty, then we don't append it to the binary name
-ifeq ($(BUILD_ID),)
-	cp $(BINARY_NAME) release/$(BINARY_NAME)-$(OS)-arm64
-	shasum -a 256 release/$(BINARY_NAME)-$(OS)-arm64 > release/$(BINARY_NAME)-$(OS)-arm64.sha256
-else
-	cp $(BINARY_NAME) release/$(BINARY_NAME)-$(BUILD_ID)-$(OS)-arm64
-	shasum -a 256 release/$(BINARY_NAME)-$(BUILD_ID)-$(OS)-arm64 > release/$(BINARY_NAME)-$(BUILD_ID)-$(OS)-arm64.sha256
-endif
+	$(GORELEASER) build --clean
 
 osx-signed: build
 	codesign --deep --force --sign "$(OSX_SIGNING_IDENTITY)" --entitlements "./Entitlements.plist" "./$(BINARY_NAME)"
 
 ## Run
-run: prepare ## run local-ai
+run: ## run local-ai
 	CGO_LDFLAGS="$(CGO_LDFLAGS)" $(GOCMD) run ./
 
-test-models/testmodel.ggml:
-	mkdir test-models
-	mkdir test-dir
-	wget -q https://huggingface.co/RichardErkhov/Qwen_-_Qwen2-1.5B-Instruct-gguf/resolve/main/Qwen2-1.5B-Instruct.Q2_K.gguf -O test-models/testmodel.ggml
-	wget -q https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin -O test-models/whisper-en
-	wget -q https://huggingface.co/mudler/all-MiniLM-L6-v2/resolve/main/ggml-model-q4_0.bin -O test-models/bert
-	wget -q https://cdn.openai.com/whisper/draft-20220913a/micro-machines.wav -O test-dir/audio.wav
-	cp tests/models_fixtures/* test-models
+prepare-test: protogen-go build-mock-backend
 
-prepare-test: grpcs
-	cp -rf backend-assets core/http
-	cp tests/models_fixtures/* test-models
+########################################################
+## Tests
+########################################################
 
 ## Test targets
-test: prepare test-models/testmodel.ggml grpcs
+## After the test-suite reorg (see plans/test-reorg) the default `make test`
+## no longer downloads multi-GB GGUF/whisper fixtures or builds llama-cpp /
+## transformers / piper / whisper / stablediffusion-ggml. core/http/app_test.go
+## now drives the mock-backend binary built by build-mock-backend; real-backend
+## inference moved into tests/e2e-backends/ (per-backend, path-filtered) and
+## tests/e2e-aio/ (nightly).
+test: prepare-test
 	@echo 'Running tests'
-	export GO_TAGS="tts debug"
-	$(MAKE) prepare-test
-	HUGGINGFACE_GRPC=$(abspath ./)/backend/python/transformers/run.sh TEST_DIR=$(abspath ./)/test-dir/ FIXTURES=$(abspath ./)/tests/fixtures CONFIG_FILE=$(abspath ./)/test-models/config.yaml MODELS_PATH=$(abspath ./)/test-models \
-	$(GOCMD) run github.com/onsi/ginkgo/v2/ginkgo --label-filter="!llama-gguf"  --flake-attempts $(TEST_FLAKES) --fail-fast -v -r $(TEST_PATHS)
-	$(MAKE) test-llama-gguf
-	$(MAKE) test-tts
-	$(MAKE) test-stablediffusion
+	export GO_TAGS="debug"
+	OPUS_SHIM_LIBRARY=$(abspath ./pkg/opus/shim/libopusshim.so) \
+	$(GOCMD) run github.com/onsi/ginkgo/v2/ginkgo --flake-attempts $(TEST_FLAKES) --fail-fast -v -r $(TEST_PATHS)
 
-prepare-e2e:
-	mkdir -p $(TEST_DIR)
-	cp -rfv $(abspath ./tests/e2e-fixtures)/gpu.yaml $(TEST_DIR)/gpu.yaml
-	test -e $(TEST_DIR)/ggllm-test-model.bin || wget -q https://huggingface.co/TheBloke/CodeLlama-7B-Instruct-GGUF/resolve/main/codellama-7b-instruct.Q2_K.gguf -O $(TEST_DIR)/ggllm-test-model.bin
-	docker build --build-arg GRPC_BACKENDS="$(GRPC_BACKENDS)" --build-arg IMAGE_TYPE=core --build-arg BUILD_TYPE=$(BUILD_TYPE) --build-arg CUDA_MAJOR_VERSION=12 --build-arg CUDA_MINOR_VERSION=0 --build-arg FFMPEG=true -t localai-tests .
+########################################################
+## Lint
+########################################################
+## Runs golangci-lint with config from .golangci.yml. Includes the standard
+## linter set plus forbidigo, which enforces the Ginkgo/Gomega-only test
+## convention documented in .agents/coding-style.md.
+##
+## LINT_EXCLUDE_DIRS_RE matches directories whose Go packages can't typecheck
+## without C/C++ headers we don't install in the lint runner (cgo wrappers
+## around llama.cpp, piper/spdlog, silero-vad/onnxruntime, and Fyne/OpenGL for
+## the launcher). Their compile-time correctness is enforced by their own
+## build pipelines. Keep this as a deny list — `go list ./...` discovers
+## everything else automatically, so new packages are scanned by default.
+LINT_EXCLUDE_DIRS_RE=/(backend/go/(piper|silero-vad|llm)|cmd/launcher)(/|$$)
 
-run-e2e-image:
-	ls -liah $(abspath ./tests/e2e-fixtures)
-	docker run -p 5390:8080 -e MODELS_PATH=/models -e THREADS=1 -e DEBUG=true -d --rm -v $(TEST_DIR):/models --gpus all --name e2e-tests-$(RANDOM) localai-tests
+lint:
+	@command -v golangci-lint >/dev/null 2>&1 || { \
+		echo 'golangci-lint not installed. Install: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest'; \
+		exit 1; \
+	}
+	golangci-lint run $$(go list -e -f '{{.Dir}}' ./... | grep -vE '$(LINT_EXCLUDE_DIRS_RE)')
+
+## Like `lint` but reports every issue, including the pre-existing baseline
+## that `lint` ignores via .golangci.yml's new-from-merge-base. Use this to
+## see what's available to clean up.
+lint-all:
+	@command -v golangci-lint >/dev/null 2>&1 || { \
+		echo 'golangci-lint not installed. Install: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest'; \
+		exit 1; \
+	}
+	golangci-lint run --new=false --new-from-merge-base= --new-from-rev= $$(go list -e -f '{{.Dir}}' ./... | grep -vE '$(LINT_EXCLUDE_DIRS_RE)')
+
+########################################################
+## E2E AIO tests (uses standard image with pre-configured models)
+########################################################
+
+docker-build-e2e:
+	docker build \
+		--build-arg MAKEFLAGS="--jobs=5 --output-sync=target" \
+		--build-arg BASE_IMAGE=$(BASE_IMAGE) \
+		--build-arg IMAGE_TYPE=$(IMAGE_TYPE) \
+		--build-arg BUILD_TYPE=$(BUILD_TYPE) \
+		--build-arg CUDA_MAJOR_VERSION=$(CUDA_MAJOR_VERSION) \
+		--build-arg CUDA_MINOR_VERSION=$(CUDA_MINOR_VERSION) \
+		--build-arg UBUNTU_VERSION=$(UBUNTU_VERSION) \
+		--build-arg UBUNTU_CODENAME=$(UBUNTU_CODENAME) \
+		--build-arg GO_TAGS="$(GO_TAGS)" \
+		-t local-ai:tests -f Dockerfile .
+
+e2e-aio:
+	LOCALAI_BACKEND_DIR=$(abspath ./backends) \
+	LOCALAI_MODELS_DIR=$(abspath ./tests/e2e-aio/models) \
+	LOCALAI_IMAGE_TAG=tests \
+	LOCALAI_IMAGE=local-ai \
+	$(MAKE) run-e2e-aio
 
 run-e2e-aio: protogen-go
 	@echo 'Running e2e AIO tests'
 	$(GOCMD) run github.com/onsi/ginkgo/v2/ginkgo --flake-attempts $(TEST_FLAKES) -v -r ./tests/e2e-aio
 
-test-e2e:
+########################################################
+## E2E tests
+########################################################
+
+prepare-e2e:
+	docker build \
+		--build-arg IMAGE_TYPE=core \
+		--build-arg BUILD_TYPE=$(BUILD_TYPE) \
+		--build-arg BASE_IMAGE=$(BASE_IMAGE) \
+		--build-arg CUDA_MAJOR_VERSION=$(CUDA_MAJOR_VERSION) \
+		--build-arg CUDA_MINOR_VERSION=$(CUDA_MINOR_VERSION) \
+		--build-arg UBUNTU_VERSION=$(UBUNTU_VERSION) \
+		--build-arg UBUNTU_CODENAME=$(UBUNTU_CODENAME) \
+		--build-arg GO_TAGS="$(GO_TAGS)" \
+		--build-arg MAKEFLAGS="$(DOCKER_MAKEFLAGS)" \
+		-t localai-tests .
+
+run-e2e-image:
+	docker run -p 5390:8080 -e MODELS_PATH=/models -e THREADS=1 -e DEBUG=true -d --rm -v $(TEST_DIR):/models --name e2e-tests-$(RANDOM) localai-tests
+
+test-e2e: build-mock-backend prepare-e2e run-e2e-image
 	@echo 'Running e2e tests'
 	BUILD_TYPE=$(BUILD_TYPE) \
-	LOCALAI_API=http://$(E2E_BRIDGE_IP):5390/v1 \
+	LOCALAI_API=http://$(E2E_BRIDGE_IP):5390 \
 	$(GOCMD) run github.com/onsi/ginkgo/v2/ginkgo --flake-attempts $(TEST_FLAKES) -v -r ./tests/e2e
+	$(MAKE) clean-mock-backend
+	$(MAKE) teardown-e2e
+	docker rmi localai-tests
 
 teardown-e2e:
 	rm -rf $(TEST_DIR) || true
 	docker stop $$(docker ps -q --filter ancestor=localai-tests)
 
-test-llama-gguf: prepare-test
-	TEST_DIR=$(abspath ./)/test-dir/ FIXTURES=$(abspath ./)/tests/fixtures CONFIG_FILE=$(abspath ./)/test-models/config.yaml MODELS_PATH=$(abspath ./)/test-models \
-	$(GOCMD) run github.com/onsi/ginkgo/v2/ginkgo --label-filter="llama-gguf" --flake-attempts $(TEST_FLAKES) -v -r $(TEST_PATHS)
+########################################################
+## Integration and unit tests
+########################################################
 
-test-tts: prepare-test
-	TEST_DIR=$(abspath ./)/test-dir/ FIXTURES=$(abspath ./)/tests/fixtures CONFIG_FILE=$(abspath ./)/test-models/config.yaml MODELS_PATH=$(abspath ./)/test-models \
-	$(GOCMD) run github.com/onsi/ginkgo/v2/ginkgo --label-filter="tts" --flake-attempts $(TEST_FLAKES) -v -r $(TEST_PATHS)
+## Storage / vector-store integration. Requires the local-store backend to
+## be available — we build it on demand and pass its location via
+## BACKENDS_PATH (the model loader looks there for the gRPC binary).
+test-stores: backends/local-store
+	BACKENDS_PATH=$(abspath ./)/backends \
+	$(GOCMD) run github.com/onsi/ginkgo/v2/ginkgo --flake-attempts $(TEST_FLAKES) -v -r tests/integration
 
-test-stablediffusion: prepare-test
-	TEST_DIR=$(abspath ./)/test-dir/ FIXTURES=$(abspath ./)/tests/fixtures CONFIG_FILE=$(abspath ./)/test-models/config.yaml MODELS_PATH=$(abspath ./)/test-models \
-	$(GOCMD) run github.com/onsi/ginkgo/v2/ginkgo --label-filter="stablediffusion" --flake-attempts $(TEST_FLAKES) -v -r $(TEST_PATHS)
+test-opus:
+	@echo 'Running opus backend tests'
+	$(MAKE) -C backend/go/opus libopusshim.so
+	$(GOCMD) run github.com/onsi/ginkgo/v2/ginkgo --flake-attempts $(TEST_FLAKES) -v -r ./backend/go/opus/...
 
-test-stores: backend-assets/grpc/local-store
-	mkdir -p tests/integration/backend-assets/grpc
-	cp -f backend-assets/grpc/local-store tests/integration/backend-assets/grpc/
-	$(GOCMD) run github.com/onsi/ginkgo/v2/ginkgo --label-filter="stores" --flake-attempts $(TEST_FLAKES) -v -r tests/integration
+test-opus-docker:
+	@echo 'Running opus backend tests in Docker'
+	docker build --target builder \
+	  --build-arg BUILD_TYPE=$(or $(BUILD_TYPE),) \
+	  --build-arg BASE_IMAGE=$(or $(BASE_IMAGE),ubuntu:24.04) \
+	  --build-arg BACKEND=opus \
+	  -t localai-opus-test -f backend/Dockerfile.golang .
+	docker run --rm localai-opus-test \
+	  bash -c 'cd /LocalAI && go run github.com/onsi/ginkgo/v2/ginkgo --flake-attempts $(TEST_FLAKES) -v -r ./backend/go/opus/...'
+
+test-realtime: build-mock-backend
+	@echo 'Running realtime e2e tests (mock backend)'
+	$(GOCMD) run github.com/onsi/ginkgo/v2/ginkgo --label-filter="Realtime && !real-models" --flake-attempts $(TEST_FLAKES) -v -r ./tests/e2e
+
+# Container-based real-model realtime testing. Build env vars / pipeline
+# definition kept here so test-realtime-models-docker can drive a fully wired
+# pipeline (VAD + STT + LLM + TTS) from inside a containerised runner.
+REALTIME_VAD?=silero-vad-ggml
+REALTIME_STT?=whisper-1
+REALTIME_LLM?=qwen3-0.6b
+REALTIME_TTS?=tts-1
+
+# --- Container-based real-model testing ---
+
+REALTIME_BACKEND_NAMES ?= silero-vad whisper llama-cpp kokoro
+REALTIME_MODELS_DIR ?= $(abspath ./models)
+REALTIME_BACKENDS_DIR ?= $(abspath ./local-backends)
+REALTIME_DOCKER_FLAGS ?= --gpus all
+
+local-backends:
+	mkdir -p local-backends
+
+extract-backend-%: docker-build-% local-backends
+	@echo "Extracting backend $*..."
+	@CID=$$(docker create local-ai-backend:$*) && \
+	  rm -rf local-backends/$* && mkdir -p local-backends/$* && \
+	  docker cp $$CID:/ - | tar -xf - -C local-backends/$* && \
+	  docker rm $$CID > /dev/null
+
+extract-realtime-backends: $(addprefix extract-backend-,$(REALTIME_BACKEND_NAMES))
+
+test-realtime-models-docker: build-mock-backend
+	docker build --target build-requirements \
+	  --build-arg BUILD_TYPE=$(or $(BUILD_TYPE),cublas) \
+	  --build-arg CUDA_MAJOR_VERSION=$(or $(CUDA_MAJOR_VERSION),13) \
+	  --build-arg CUDA_MINOR_VERSION=$(or $(CUDA_MINOR_VERSION),0) \
+	  -t localai-test-runner .
+	docker run --rm \
+	  $(REALTIME_DOCKER_FLAGS) \
+	  -v $(abspath ./):/build \
+	  -v $(REALTIME_MODELS_DIR):/models:ro \
+	  -v $(REALTIME_BACKENDS_DIR):/backends \
+	  -v localai-go-cache:/root/go/pkg/mod \
+	  -v localai-go-build-cache:/root/.cache/go-build \
+	  -e REALTIME_TEST_MODEL=$${REALTIME_TEST_MODEL:-realtime-test-pipeline} \
+	  -e REALTIME_VAD=$(REALTIME_VAD) \
+	  -e REALTIME_STT=$(REALTIME_STT) \
+	  -e REALTIME_LLM=$(REALTIME_LLM) \
+	  -e REALTIME_TTS=$(REALTIME_TTS) \
+	  -e REALTIME_BACKENDS_PATH=/backends \
+	  -e REALTIME_MODELS_PATH=/models \
+	  -w /build \
+	  localai-test-runner \
+	  bash -c 'git config --global --add safe.directory /build && \
+	    make protogen-go && make build-mock-backend && \
+	    go run github.com/onsi/ginkgo/v2/ginkgo --label-filter="Realtime" --flake-attempts $(TEST_FLAKES) -v -r ./tests/e2e'
 
 test-container:
 	docker build --target requirements -t local-ai-test-container .
 	docker run -ti --rm --entrypoint /bin/bash -ti -v $(abspath ./):/build local-ai-test-container
+
+########################################################
+## Help
+########################################################
 
 ## Help:
 help: ## Show this help.
@@ -531,283 +359,536 @@ help: ## Show this help.
 		else if (/^## .*$$/) {printf "  ${CYAN}%s${RESET}\n", substr($$1,4)} \
 		}' $(MAKEFILE_LIST)
 
-.PHONY: protogen
-protogen: protogen-go protogen-python
+########################################################
+## Backends
+########################################################
 
-.PHONY: protogen-clean
-protogen-clean: protogen-go-clean protogen-python-clean
+.PHONY: protogen
+protogen: protogen-go
+
+protoc:
+	@OS_NAME=$$(uname -s | tr '[:upper:]' '[:lower:]'); \
+	ARCH_NAME=$$(uname -m); \
+	if [ "$$OS_NAME" = "darwin" ]; then \
+	  if [ "$$ARCH_NAME" = "arm64" ]; then \
+	    FILE=protoc-31.1-osx-aarch_64.zip; \
+	  elif [ "$$ARCH_NAME" = "x86_64" ]; then \
+	    FILE=protoc-31.1-osx-x86_64.zip; \
+	  else \
+	    echo "Unsupported macOS architecture: $$ARCH_NAME"; exit 1; \
+	  fi; \
+	elif [ "$$OS_NAME" = "linux" ]; then \
+	  if [ "$$ARCH_NAME" = "x86_64" ]; then \
+	    FILE=protoc-31.1-linux-x86_64.zip; \
+	  elif [ "$$ARCH_NAME" = "aarch64" ] || [ "$$ARCH_NAME" = "arm64" ]; then \
+	    FILE=protoc-31.1-linux-aarch_64.zip; \
+	  elif [ "$$ARCH_NAME" = "ppc64le" ]; then \
+	    FILE=protoc-31.1-linux-ppcle_64.zip; \
+	  elif [ "$$ARCH_NAME" = "s390x" ]; then \
+	    FILE=protoc-31.1-linux-s390_64.zip; \
+	  elif [ "$$ARCH_NAME" = "i386" ] || [ "$$ARCH_NAME" = "x86" ]; then \
+	    FILE=protoc-31.1-linux-x86_32.zip; \
+	  else \
+	    echo "Unsupported Linux architecture: $$ARCH_NAME"; exit 1; \
+	  fi; \
+	else \
+	  echo "Unsupported OS: $$OS_NAME"; exit 1; \
+	fi; \
+	URL=https://github.com/protocolbuffers/protobuf/releases/download/v31.1/$$FILE; \
+	curl -L $$URL -o protoc.zip && \
+	unzip -j -d $(CURDIR) protoc.zip bin/protoc && rm protoc.zip
 
 .PHONY: protogen-go
-protogen-go: install-go-tools
+protogen-go: protoc install-go-tools
 	mkdir -p pkg/grpc/proto
-	protoc --experimental_allow_proto3_optional -Ibackend/ --go_out=pkg/grpc/proto/ --go_opt=paths=source_relative --go-grpc_out=pkg/grpc/proto/ --go-grpc_opt=paths=source_relative \
+	# install-go-tools writes protoc-gen-go and protoc-gen-go-grpc into
+	# $(shell go env GOPATH)/bin, which isn't on every dev's PATH. protoc
+	# resolves its code-gen plugins via PATH, so without this prefix the
+	# generate step fails with "protoc-gen-go: program not found". Prepend
+	# GOPATH/bin so the freshly-installed plugins win without requiring a
+	# shell-profile change.
+	PATH="$$(go env GOPATH)/bin:$$PATH" ./protoc --experimental_allow_proto3_optional -Ibackend/ --go_out=pkg/grpc/proto/ --go_opt=paths=source_relative --go-grpc_out=pkg/grpc/proto/ --go-grpc_opt=paths=source_relative \
     backend/backend.proto
+
+core/config/inference_defaults.json: ## Fetch inference defaults from unsloth (only if missing)
+	$(GOCMD) generate ./core/config/...
+
+.PHONY: generate
+generate: core/config/inference_defaults.json ## Ensure inference defaults exist
+
+.PHONY: generate-force
+generate-force: ## Re-fetch inference defaults from unsloth (always)
+	$(GOCMD) generate ./core/config/...
 
 .PHONY: protogen-go-clean
 protogen-go-clean:
 	$(RM) pkg/grpc/proto/backend.pb.go pkg/grpc/proto/backend_grpc.pb.go
 	$(RM) bin/*
 
-.PHONY: protogen-python
-protogen-python: bark-protogen coqui-protogen diffusers-protogen exllama2-protogen rerankers-protogen transformers-protogen kokoro-protogen vllm-protogen faster-whisper-protogen
-
-.PHONY: protogen-python-clean
-protogen-python-clean: bark-protogen-clean coqui-protogen-clean diffusers-protogen-clean  exllama2-protogen-clean rerankers-protogen-clean transformers-protogen-clean kokoro-protogen-clean vllm-protogen-clean faster-whisper-protogen-clean
-
-.PHONY: bark-protogen
-bark-protogen:
-	$(MAKE) -C backend/python/bark protogen
-
-.PHONY: bark-protogen-clean
-bark-protogen-clean:
-	$(MAKE) -C backend/python/bark protogen-clean
-
-.PHONY: coqui-protogen
-coqui-protogen:
-	$(MAKE) -C backend/python/coqui protogen
-
-.PHONY: coqui-protogen-clean
-coqui-protogen-clean:
-	$(MAKE) -C backend/python/coqui protogen-clean
-
-.PHONY: diffusers-protogen
-diffusers-protogen:
-	$(MAKE) -C backend/python/diffusers protogen
-
-.PHONY: diffusers-protogen-clean
-diffusers-protogen-clean:
-	$(MAKE) -C backend/python/diffusers protogen-clean
-
-.PHONY: faster-whisper-protogen
-faster-whisper-protogen:
-	$(MAKE) -C backend/python/faster-whisper protogen
-
-.PHONY: faster-whisper-protogen-clean
-faster-whisper-protogen-clean:
-	$(MAKE) -C backend/python/faster-whisper protogen-clean
-
-.PHONY: exllama2-protogen
-exllama2-protogen:
-	$(MAKE) -C backend/python/exllama2 protogen
-
-.PHONY: exllama2-protogen-clean
-exllama2-protogen-clean:
-	$(MAKE) -C backend/python/exllama2 protogen-clean
-
-.PHONY: rerankers-protogen
-rerankers-protogen:
-	$(MAKE) -C backend/python/rerankers protogen
-
-.PHONY: rerankers-protogen-clean
-rerankers-protogen-clean:
-	$(MAKE) -C backend/python/rerankers protogen-clean
-
-.PHONY: transformers-protogen
-transformers-protogen:
-	$(MAKE) -C backend/python/transformers protogen
-
-.PHONY: transformers-protogen-clean
-transformers-protogen-clean:
-	$(MAKE) -C backend/python/transformers protogen-clean
-
-.PHONY: kokoro-protogen
-kokoro-protogen:
-	$(MAKE) -C backend/python/kokoro protogen
-
-.PHONY: kokoro-protogen-clean
-kokoro-protogen-clean:
-	$(MAKE) -C backend/python/kokoro protogen-clean
-
-.PHONY: vllm-protogen
-vllm-protogen:
-	$(MAKE) -C backend/python/vllm protogen
-
-.PHONY: vllm-protogen-clean
-vllm-protogen-clean:
-	$(MAKE) -C backend/python/vllm protogen-clean
-
-## GRPC
-# Note: it is duplicated in the Dockerfile
-prepare-extra-conda-environments: protogen-python
-	$(MAKE) -C backend/python/bark
-	$(MAKE) -C backend/python/coqui
-	$(MAKE) -C backend/python/diffusers
-	$(MAKE) -C backend/python/faster-whisper
-	$(MAKE) -C backend/python/vllm
-	$(MAKE) -C backend/python/rerankers
-	$(MAKE) -C backend/python/transformers
-	$(MAKE) -C backend/python/kokoro
-	$(MAKE) -C backend/python/exllama2
-
 prepare-test-extra: protogen-python
 	$(MAKE) -C backend/python/transformers
+	$(MAKE) -C backend/python/outetts
 	$(MAKE) -C backend/python/diffusers
+	$(MAKE) -C backend/python/chatterbox
 	$(MAKE) -C backend/python/vllm
+	$(MAKE) -C backend/python/vllm-omni
+	$(MAKE) -C backend/python/sglang
+	$(MAKE) -C backend/python/vibevoice
+	$(MAKE) -C backend/python/moonshine
+	$(MAKE) -C backend/python/pocket-tts
+	$(MAKE) -C backend/python/qwen-tts
+	$(MAKE) -C backend/python/fish-speech
+	$(MAKE) -C backend/python/faster-qwen3-tts
+	$(MAKE) -C backend/python/qwen-asr
+	$(MAKE) -C backend/python/nemo
+	$(MAKE) -C backend/python/voxcpm
+	$(MAKE) -C backend/python/faster-whisper
+	$(MAKE) -C backend/python/whisperx
+	$(MAKE) -C backend/python/ace-step
+	$(MAKE) -C backend/python/trl
+	$(MAKE) -C backend/python/tinygrad
+	$(MAKE) -C backend/python/insightface
+	$(MAKE) -C backend/python/speaker-recognition
+	$(MAKE) -C backend/rust/kokoros kokoros-grpc
 
 test-extra: prepare-test-extra
 	$(MAKE) -C backend/python/transformers test
+	$(MAKE) -C backend/python/outetts test
 	$(MAKE) -C backend/python/diffusers test
+	$(MAKE) -C backend/python/chatterbox test
 	$(MAKE) -C backend/python/vllm test
+	$(MAKE) -C backend/python/vllm-omni test
+	$(MAKE) -C backend/python/vibevoice test
+	$(MAKE) -C backend/python/moonshine test
+	$(MAKE) -C backend/python/pocket-tts test
+	$(MAKE) -C backend/python/qwen-tts test
+	$(MAKE) -C backend/python/fish-speech test
+	$(MAKE) -C backend/python/faster-qwen3-tts test
+	$(MAKE) -C backend/python/qwen-asr test
+	$(MAKE) -C backend/python/nemo test
+	$(MAKE) -C backend/python/voxcpm test
+	$(MAKE) -C backend/python/faster-whisper test
+	$(MAKE) -C backend/python/whisperx test
+	$(MAKE) -C backend/python/ace-step test
+	$(MAKE) -C backend/python/trl test
+	$(MAKE) -C backend/python/tinygrad test
+	$(MAKE) -C backend/python/insightface test
+	$(MAKE) -C backend/python/speaker-recognition test
+	$(MAKE) -C backend/rust/kokoros test
 
-backend-assets:
-	mkdir -p backend-assets
-ifeq ($(BUILD_API_ONLY),true)
-	touch backend-assets/keep
-endif
+##
+## End-to-end gRPC tests that exercise a built backend container image.
+##
+## The test suite in tests/e2e-backends is backend-agnostic. You drive it via env
+## vars (see tests/e2e-backends/backend_test.go for the full list) and the
+## capability-driven harness picks which gRPC RPCs to exercise:
+##
+##   BACKEND_IMAGE            Required. Docker image to test, e.g. local-ai-backend:llama-cpp.
+##   BACKEND_TEST_MODEL_URL   URL of a model file to download and load.
+##   BACKEND_TEST_MODEL_FILE  Path to an already-downloaded model (skips download).
+##   BACKEND_TEST_MODEL_NAME  HuggingFace repo id (e.g. Qwen/Qwen2.5-0.5B-Instruct).
+##                            Use this instead of MODEL_URL for backends that
+##                            resolve HF model ids natively (vllm, vllm-omni).
+##   BACKEND_TEST_CAPS        Comma-separated capabilities, default "health,load,predict,stream".
+##                            Adds "tools" to exercise ChatDelta tool call extraction.
+##   BACKEND_TEST_PROMPT      Override the prompt used in predict/stream specs.
+##   BACKEND_TEST_OPTIONS     Comma-separated Options[] entries forwarded to LoadModel,
+##                            e.g. "tool_parser:hermes,reasoning_parser:qwen3".
+##
+## Direct usage (image already built, no docker-build-* dependency):
+##
+##   make test-extra-backend BACKEND_IMAGE=local-ai-backend:llama-cpp \
+##       BACKEND_TEST_MODEL_URL=https://.../model.gguf
+##
+## Convenience wrappers below build a specific backend image first, then run the
+## suite against it.
+##
+BACKEND_TEST_MODEL_URL?=https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf
 
-backend-assets/espeak-ng-data: sources/go-piper sources/go-piper/libpiper_binding.a
-	mkdir -p backend-assets/espeak-ng-data
-	@cp -rf sources/go-piper/piper-phonemize/pi/share/espeak-ng-data/. backend-assets/espeak-ng-data
+## Generic target — runs the suite against whatever BACKEND_IMAGE points at.
+## Depends on protogen-go so pkg/grpc/proto is generated before `go test`.
+test-extra-backend: protogen-go
+	@test -n "$$BACKEND_IMAGE" || { echo "BACKEND_IMAGE must be set" >&2; exit 1; }
+	BACKEND_IMAGE="$$BACKEND_IMAGE" \
+	BACKEND_TEST_MODEL_URL="$${BACKEND_TEST_MODEL_URL:-$(BACKEND_TEST_MODEL_URL)}" \
+	BACKEND_TEST_MODEL_FILE="$$BACKEND_TEST_MODEL_FILE" \
+	BACKEND_TEST_MODEL_NAME="$$BACKEND_TEST_MODEL_NAME" \
+	BACKEND_TEST_MMPROJ_URL="$$BACKEND_TEST_MMPROJ_URL" \
+	BACKEND_TEST_MMPROJ_FILE="$$BACKEND_TEST_MMPROJ_FILE" \
+	BACKEND_TEST_AUDIO_URL="$$BACKEND_TEST_AUDIO_URL" \
+	BACKEND_TEST_AUDIO_FILE="$$BACKEND_TEST_AUDIO_FILE" \
+	BACKEND_TEST_CAPS="$$BACKEND_TEST_CAPS" \
+	BACKEND_TEST_PROMPT="$$BACKEND_TEST_PROMPT" \
+	BACKEND_TEST_OPTIONS="$$BACKEND_TEST_OPTIONS" \
+	BACKEND_TEST_TOOL_PROMPT="$$BACKEND_TEST_TOOL_PROMPT" \
+	BACKEND_TEST_TOOL_NAME="$$BACKEND_TEST_TOOL_NAME" \
+	BACKEND_TEST_CACHE_TYPE_K="$$BACKEND_TEST_CACHE_TYPE_K" \
+	BACKEND_TEST_CACHE_TYPE_V="$$BACKEND_TEST_CACHE_TYPE_V" \
+	BACKEND_TEST_FACE_IMAGE_1_URL="$$BACKEND_TEST_FACE_IMAGE_1_URL" \
+	BACKEND_TEST_FACE_IMAGE_1_FILE="$$BACKEND_TEST_FACE_IMAGE_1_FILE" \
+	BACKEND_TEST_FACE_IMAGE_2_URL="$$BACKEND_TEST_FACE_IMAGE_2_URL" \
+	BACKEND_TEST_FACE_IMAGE_2_FILE="$$BACKEND_TEST_FACE_IMAGE_2_FILE" \
+	BACKEND_TEST_FACE_IMAGE_3_URL="$$BACKEND_TEST_FACE_IMAGE_3_URL" \
+	BACKEND_TEST_FACE_IMAGE_3_FILE="$$BACKEND_TEST_FACE_IMAGE_3_FILE" \
+	BACKEND_TEST_VERIFY_DISTANCE_CEILING="$$BACKEND_TEST_VERIFY_DISTANCE_CEILING" \
+	go test -v -timeout 30m ./tests/e2e-backends/...
 
-backend-assets/grpc: protogen-go replace
-	mkdir -p backend-assets/grpc
+## Convenience wrappers: build the image, then exercise it.
+test-extra-backend-llama-cpp: docker-build-llama-cpp
+	BACKEND_IMAGE=local-ai-backend:llama-cpp \
+	BACKEND_TEST_CAPS=health,load,predict,stream,logprobs,logit_bias \
+	$(MAKE) test-extra-backend
 
-backend-assets/grpc/huggingface: backend-assets/grpc
-	$(GOCMD) build -ldflags "$(LD_FLAGS)" -tags "$(GO_TAGS)" -o backend-assets/grpc/huggingface ./backend/go/llm/langchain/
-ifneq ($(UPX),)
-	$(UPX) backend-assets/grpc/huggingface
-endif
+test-extra-backend-ik-llama-cpp: docker-build-ik-llama-cpp
+	BACKEND_IMAGE=local-ai-backend:ik-llama-cpp $(MAKE) test-extra-backend
 
-backend/cpp/llama/llama.cpp:
-	LLAMA_VERSION=$(CPPLLAMA_VERSION) $(MAKE) -C backend/cpp/llama llama.cpp
+## turboquant: exercises the llama.cpp-fork backend with the fork's
+## *TurboQuant-specific* KV-cache types (turbo3 for both K and V). turbo3
+## is what makes this backend distinct from stock llama-cpp — picking q8_0
+## here would only test the standard llama.cpp code path that the upstream
+## llama-cpp backend already covers. The fork auto-enables flash_attention
+## when turbo3/turbo4 are active, so we don't need to set it explicitly.
+test-extra-backend-turboquant: docker-build-turboquant
+	BACKEND_IMAGE=local-ai-backend:turboquant \
+	BACKEND_TEST_CACHE_TYPE_K=q8_0 \
+	BACKEND_TEST_CACHE_TYPE_V=turbo3 \
+	$(MAKE) test-extra-backend
 
-INSTALLED_PACKAGES=$(CURDIR)/backend/cpp/grpc/installed_packages
-INSTALLED_LIB_CMAKE=$(INSTALLED_PACKAGES)/lib/cmake
-ADDED_CMAKE_ARGS=-Dabsl_DIR=${INSTALLED_LIB_CMAKE}/absl \
-				 -DProtobuf_DIR=${INSTALLED_LIB_CMAKE}/protobuf \
-				 -Dutf8_range_DIR=${INSTALLED_LIB_CMAKE}/utf8_range \
-				 -DgRPC_DIR=${INSTALLED_LIB_CMAKE}/grpc \
-				 -DCMAKE_CXX_STANDARD_INCLUDE_DIRECTORIES=${INSTALLED_PACKAGES}/include
-build-llama-cpp-grpc-server:
-# Conditionally build grpc for the llama backend to use if needed
-ifdef BUILD_GRPC_FOR_BACKEND_LLAMA
-	$(MAKE) -C backend/cpp/grpc build
-	_PROTOBUF_PROTOC=${INSTALLED_PACKAGES}/bin/proto \
-	_GRPC_CPP_PLUGIN_EXECUTABLE=${INSTALLED_PACKAGES}/bin/grpc_cpp_plugin \
-	PATH="${INSTALLED_PACKAGES}/bin:${PATH}" \
-	CMAKE_ARGS="${CMAKE_ARGS} ${ADDED_CMAKE_ARGS}" \
-	LLAMA_VERSION=$(CPPLLAMA_VERSION) \
-	$(MAKE) -C backend/cpp/${VARIANT} grpc-server
-else
-	echo "BUILD_GRPC_FOR_BACKEND_LLAMA is not defined."
-	LLAMA_VERSION=$(CPPLLAMA_VERSION) $(MAKE) -C backend/cpp/${VARIANT} grpc-server
-endif
+## Audio transcription wrapper for the llama-cpp backend.
+## Drives the new AudioTranscription / AudioTranscriptionStream RPCs against
+## ggml-org/Qwen3-ASR-0.6B-GGUF (a small ASR model that requires its mmproj
+## audio encoder companion). The audio fixture is a short public-domain
+## "jfk.wav" clip ggml-org bundles with whisper.cpp's CI assets.
+test-extra-backend-llama-cpp-transcription: docker-build-llama-cpp
+	BACKEND_IMAGE=local-ai-backend:llama-cpp \
+	BACKEND_TEST_MODEL_URL=https://huggingface.co/ggml-org/Qwen3-ASR-0.6B-GGUF/resolve/main/Qwen3-ASR-0.6B-Q8_0.gguf \
+	BACKEND_TEST_MMPROJ_URL=https://huggingface.co/ggml-org/Qwen3-ASR-0.6B-GGUF/resolve/main/mmproj-Qwen3-ASR-0.6B-Q8_0.gguf \
+	BACKEND_TEST_AUDIO_URL=https://github.com/ggml-org/whisper.cpp/raw/master/samples/jfk.wav \
+	BACKEND_TEST_CAPS=health,load,transcription \
+	$(MAKE) test-extra-backend
 
-# This target is for manually building a variant with-auto detected flags
-backend-assets/grpc/llama-cpp: backend-assets/grpc backend/cpp/llama/llama.cpp
-	cp -rf backend/cpp/llama backend/cpp/llama-cpp
-	$(MAKE) -C backend/cpp/llama-cpp purge
-	$(info ${GREEN}I llama-cpp build info:avx2${RESET})
-	$(MAKE) VARIANT="llama-cpp" build-llama-cpp-grpc-server
-	cp -rfv backend/cpp/llama-cpp/grpc-server backend-assets/grpc/llama-cpp
+## vllm is resolved from a HuggingFace model id (no file download) and
+## exercises Predict + streaming + tool-call extraction via the hermes parser.
+## Requires a host CPU with the SIMD instructions the prebuilt vllm CPU
+## wheel was compiled against (AVX-512 VNNI/BF16); older CPUs will SIGILL
+## on import — on CI this means using the bigger-runner label.
+test-extra-backend-vllm: docker-build-vllm
+	BACKEND_IMAGE=local-ai-backend:vllm \
+	BACKEND_TEST_MODEL_NAME=Qwen/Qwen2.5-0.5B-Instruct \
+	BACKEND_TEST_CAPS=health,load,predict,stream,tools \
+	BACKEND_TEST_OPTIONS=tool_parser:hermes \
+	$(MAKE) test-extra-backend
 
-backend-assets/grpc/llama-cpp-avx2: backend-assets/grpc backend/cpp/llama/llama.cpp
-	cp -rf backend/cpp/llama backend/cpp/llama-avx2
-	$(MAKE) -C backend/cpp/llama-avx2 purge
-	$(info ${GREEN}I llama-cpp build info:avx2${RESET})
-	CMAKE_ARGS="$(CMAKE_ARGS) -DGGML_AVX=on -DGGML_AVX2=on -DGGML_AVX512=off -DGGML_FMA=on -DGGML_F16C=on" $(MAKE) VARIANT="llama-avx2" build-llama-cpp-grpc-server
-	cp -rfv backend/cpp/llama-avx2/grpc-server backend-assets/grpc/llama-cpp-avx2
+## tinygrad mirrors the vllm target (same model, same caps, same parser) so
+## the two backends are directly comparable. The LLM path covers Predict,
+## streaming and native tool-call extraction. Companion targets below cover
+## embeddings, Stable Diffusion and Whisper — run them individually or via
+## the `test-extra-backend-tinygrad-all` aggregate.
+test-extra-backend-tinygrad: docker-build-tinygrad
+	BACKEND_IMAGE=local-ai-backend:tinygrad \
+	BACKEND_TEST_MODEL_NAME=Qwen/Qwen3-0.6B \
+	BACKEND_TEST_CAPS=health,load,predict,stream,tools \
+	BACKEND_TEST_OPTIONS=tool_parser:hermes \
+	$(MAKE) test-extra-backend
 
-backend-assets/grpc/llama-cpp-avx512: backend-assets/grpc backend/cpp/llama/llama.cpp
-	cp -rf backend/cpp/llama backend/cpp/llama-avx512
-	$(MAKE) -C backend/cpp/llama-avx512 purge
-	$(info ${GREEN}I llama-cpp build info:avx512${RESET})
-	CMAKE_ARGS="$(CMAKE_ARGS) -DGGML_AVX=on -DGGML_AVX2=off -DGGML_AVX512=on -DGGML_FMA=on -DGGML_F16C=on" $(MAKE) VARIANT="llama-avx512" build-llama-cpp-grpc-server
-	cp -rfv backend/cpp/llama-avx512/grpc-server backend-assets/grpc/llama-cpp-avx512
+## tinygrad — embeddings via LLM last-hidden-state pooling. Reuses the same
+## Qwen3-0.6B as the chat target so we don't need a separate BERT vendor;
+## the Embedding RPC mean-pools and L2-normalizes the last-layer hidden
+## state.
+test-extra-backend-tinygrad-embeddings: docker-build-tinygrad
+	BACKEND_IMAGE=local-ai-backend:tinygrad \
+	BACKEND_TEST_MODEL_NAME=Qwen/Qwen3-0.6B \
+	BACKEND_TEST_CAPS=health,load,embeddings \
+	$(MAKE) test-extra-backend
 
-backend-assets/grpc/llama-cpp-avx: backend-assets/grpc backend/cpp/llama/llama.cpp
-	cp -rf backend/cpp/llama backend/cpp/llama-avx
-	$(MAKE) -C backend/cpp/llama-avx purge
-	$(info ${GREEN}I llama-cpp build info:avx${RESET})
-	CMAKE_ARGS="$(CMAKE_ARGS) -DGGML_AVX=on -DGGML_AVX2=off -DGGML_AVX512=off -DGGML_FMA=off -DGGML_F16C=off" $(MAKE) VARIANT="llama-avx" build-llama-cpp-grpc-server
-	cp -rfv backend/cpp/llama-avx/grpc-server backend-assets/grpc/llama-cpp-avx
+## tinygrad — Stable Diffusion 1.5. The original CompVis/runwayml repos have
+## been gated, so we use the community-maintained mirror at
+## stable-diffusion-v1-5/stable-diffusion-v1-5 with the EMA-only pruned
+## checkpoint (~4.3GB). Step count is kept low (4) so a CPU-only run finishes
+## in a few minutes; bump BACKEND_TEST_IMAGE_STEPS for higher quality.
+test-extra-backend-tinygrad-sd: docker-build-tinygrad
+	BACKEND_IMAGE=local-ai-backend:tinygrad \
+	BACKEND_TEST_MODEL_NAME=stable-diffusion-v1-5/stable-diffusion-v1-5 \
+	BACKEND_TEST_CAPS=health,load,image \
+	$(MAKE) test-extra-backend
 
-backend-assets/grpc/llama-cpp-fallback: backend-assets/grpc backend/cpp/llama/llama.cpp
-	cp -rf backend/cpp/llama backend/cpp/llama-fallback
-	$(MAKE) -C backend/cpp/llama-fallback purge
-	$(info ${GREEN}I llama-cpp build info:fallback${RESET})
-	CMAKE_ARGS="$(CMAKE_ARGS) -DGGML_AVX=off -DGGML_AVX2=off -DGGML_AVX512=off -DGGML_FMA=off -DGGML_F16C=off" $(MAKE) VARIANT="llama-fallback" build-llama-cpp-grpc-server
-	cp -rfv backend/cpp/llama-fallback/grpc-server backend-assets/grpc/llama-cpp-fallback
+## tinygrad — Whisper. Loads OpenAI's tiny.en checkpoint (smallest at ~75MB)
+## from the original azure CDN through tinygrad's `fetch` helper, and
+## transcribes the canonical jfk.wav fixture from whisper.cpp's CI samples.
+## Exercises both AudioTranscription and AudioTranscriptionStream.
+test-extra-backend-tinygrad-whisper: docker-build-tinygrad
+	BACKEND_IMAGE=local-ai-backend:tinygrad \
+	BACKEND_TEST_MODEL_NAME=openai/whisper-tiny.en \
+	BACKEND_TEST_AUDIO_URL=https://github.com/ggml-org/whisper.cpp/raw/master/samples/jfk.wav \
+	BACKEND_TEST_CAPS=health,load,transcription \
+	$(MAKE) test-extra-backend
 
-backend-assets/grpc/llama-cpp-cuda: backend-assets/grpc backend/cpp/llama/llama.cpp
-	cp -rf backend/cpp/llama backend/cpp/llama-cuda
-	$(MAKE) -C backend/cpp/llama-cuda purge
-	$(info ${GREEN}I llama-cpp build info:cuda${RESET})
-	CMAKE_ARGS="$(CMAKE_ARGS) -DGGML_AVX=on -DGGML_AVX2=off -DGGML_AVX512=off -DGGML_FMA=off -DGGML_F16C=off -DGGML_CUDA=ON" $(MAKE) VARIANT="llama-cuda" build-llama-cpp-grpc-server
-	cp -rfv backend/cpp/llama-cuda/grpc-server backend-assets/grpc/llama-cpp-cuda
+test-extra-backend-tinygrad-all: \
+	test-extra-backend-tinygrad \
+	test-extra-backend-tinygrad-embeddings \
+	test-extra-backend-tinygrad-sd \
+	test-extra-backend-tinygrad-whisper
 
-backend-assets/grpc/llama-cpp-hipblas: backend-assets/grpc backend/cpp/llama/llama.cpp
-	cp -rf backend/cpp/llama backend/cpp/llama-hipblas
-	$(MAKE) -C backend/cpp/llama-hipblas purge
-	$(info ${GREEN}I llama-cpp build info:hipblas${RESET})
-	CMAKE_ARGS="$(CMAKE_ARGS) -DGGML_AVX=off -DGGML_AVX2=off -DGGML_AVX512=off -DGGML_FMA=off -DGGML_F16C=off" BUILD_TYPE="hipblas" $(MAKE) VARIANT="llama-hipblas" build-llama-cpp-grpc-server
-	cp -rfv backend/cpp/llama-hipblas/grpc-server backend-assets/grpc/llama-cpp-hipblas
+## insightface — face recognition.
+##
+## Face fixtures default to the sample images shipped in the
+## deepinsight/insightface repository (MIT-licensed). For offline/local
+## runs override with BACKEND_TEST_FACE_IMAGE_{1,2,3}_FILE pointing at
+## local paths.
+FACE_IMAGE_1_URL ?= https://github.com/deepinsight/insightface/raw/master/python-package/insightface/data/images/t1.jpg
+FACE_IMAGE_2_URL ?= https://github.com/deepinsight/insightface/raw/master/python-package/insightface/data/images/t1.jpg
+FACE_IMAGE_3_URL ?= https://github.com/deepinsight/insightface/raw/master/python-package/insightface/data/images/mask_white.jpg
+## Known spoof fixture used by the face_antispoof e2e cap. This is
+## upstream's own `image_F2.jpg` (Silent-Face repo, via yakhyo mirror)
+## — verified to classify as is_real=false with score < 0.05 on the
+## MiniFASNetV2 + MiniFASNetV1SE ensemble.
+FACE_SPOOF_IMAGE_URL ?= https://github.com/yakhyo/face-anti-spoofing/raw/main/assets/image_F2.jpg
 
-backend-assets/grpc/llama-cpp-sycl_f16: backend-assets/grpc backend/cpp/llama/llama.cpp
-	cp -rf backend/cpp/llama backend/cpp/llama-sycl_f16
-	$(MAKE) -C backend/cpp/llama-sycl_f16 purge
-	$(info ${GREEN}I llama-cpp build info:sycl_f16${RESET})
-	BUILD_TYPE="sycl_f16" $(MAKE) VARIANT="llama-sycl_f16" build-llama-cpp-grpc-server
-	cp -rfv backend/cpp/llama-sycl_f16/grpc-server backend-assets/grpc/llama-cpp-sycl_f16
+## Host-side cache for the OpenCV Zoo face ONNX files used by the
+## opencv e2e target. The backend image no longer bakes model weights —
+## gallery installs bring them via `files:` — but the e2e suite drives
+## LoadModel over gRPC directly without going through the gallery. We
+## pre-download the ONNX files to a stable host path and pass absolute
+## paths in BACKEND_TEST_OPTIONS; `make` skips the downloads when the
+## SHA-256 already matches.
+INSIGHTFACE_OPENCV_DIR := /tmp/localai-insightface-opencv-cache
+INSIGHTFACE_OPENCV_YUNET_URL := https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx
+INSIGHTFACE_OPENCV_SFACE_URL := https://github.com/opencv/opencv_zoo/raw/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx
+INSIGHTFACE_OPENCV_YUNET_SHA := 8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4
+INSIGHTFACE_OPENCV_SFACE_SHA := 0ba9fbfa01b5270c96627c4ef784da859931e02f04419c829e83484087c34e79
 
-backend-assets/grpc/llama-cpp-sycl_f32: backend-assets/grpc backend/cpp/llama/llama.cpp
-	cp -rf backend/cpp/llama backend/cpp/llama-sycl_f32
-	$(MAKE) -C backend/cpp/llama-sycl_f32 purge
-	$(info ${GREEN}I llama-cpp build info:sycl_f32${RESET})
-	BUILD_TYPE="sycl_f32" $(MAKE) VARIANT="llama-sycl_f32" build-llama-cpp-grpc-server
-	cp -rfv backend/cpp/llama-sycl_f32/grpc-server backend-assets/grpc/llama-cpp-sycl_f32
+## buffalo_sc (insightface) — pack zip + SHA-256 mirrors the gallery
+## entry so the e2e target matches exactly what `local-ai models install
+## insightface-buffalo-sc` would have fetched. Smallest insightface pack
+## (~16MB) — keeps CI fast while still covering the insightface engine
+## code path end-to-end.
+INSIGHTFACE_BUFFALO_SC_DIR := /tmp/localai-insightface-buffalo-sc-cache
+INSIGHTFACE_BUFFALO_SC_URL := https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_sc.zip
+INSIGHTFACE_BUFFALO_SC_SHA := 57d31b56b6ffa911c8a73cfc1707c73cab76efe7f13b675a05223bf42de47c72
 
-backend-assets/grpc/llama-cpp-grpc: backend-assets/grpc backend/cpp/llama/llama.cpp
-	cp -rf backend/cpp/llama backend/cpp/llama-grpc
-	$(MAKE) -C backend/cpp/llama-grpc purge
-	$(info ${GREEN}I llama-cpp build info:grpc${RESET})
-	CMAKE_ARGS="$(CMAKE_ARGS) -DGGML_RPC=ON -DGGML_AVX=off -DGGML_AVX2=off -DGGML_AVX512=off -DGGML_FMA=off -DGGML_F16C=off" TARGET="--target grpc-server --target rpc-server" $(MAKE) VARIANT="llama-grpc" build-llama-cpp-grpc-server
-	cp -rfv backend/cpp/llama-grpc/grpc-server backend-assets/grpc/llama-cpp-grpc
+## Silent-Face antispoofing (MiniFASNetV2 + MiniFASNetV1SE) — shared
+## between the buffalo_sc and opencv e2e targets. Both ONNX files are
+## ~1.7MB, Apache 2.0. URLs + SHAs mirror the gallery entries.
+INSIGHTFACE_ANTISPOOF_DIR := /tmp/localai-insightface-antispoof-cache
+INSIGHTFACE_ANTISPOOF_V2_URL := https://github.com/yakhyo/face-anti-spoofing/releases/download/weights/MiniFASNetV2.onnx
+INSIGHTFACE_ANTISPOOF_V2_SHA := b32929adc2d9c34b9486f8c4c7bc97c1b69bc0ea9befefc380e4faae4e463907
+INSIGHTFACE_ANTISPOOF_V1SE_URL := https://github.com/yakhyo/face-anti-spoofing/releases/download/weights/MiniFASNetV1SE.onnx
+INSIGHTFACE_ANTISPOOF_V1SE_SHA := ebab7f90c7833fbccd46d3a555410e78d969db5438e169b6524be444862b3676
 
-backend-assets/util/llama-cpp-rpc-server: backend-assets/grpc/llama-cpp-grpc
-	mkdir -p backend-assets/util/
-	cp -rf backend/cpp/llama-grpc/llama.cpp/build/bin/rpc-server backend-assets/util/llama-cpp-rpc-server
+.PHONY: insightface-opencv-models
+insightface-opencv-models:
+	@mkdir -p $(INSIGHTFACE_OPENCV_DIR)
+	@if [ "$$(sha256sum $(INSIGHTFACE_OPENCV_DIR)/yunet.onnx 2>/dev/null | awk '{print $$1}')" != "$(INSIGHTFACE_OPENCV_YUNET_SHA)" ]; then \
+		echo "Fetching YuNet..."; \
+		curl -fsSL -o $(INSIGHTFACE_OPENCV_DIR)/yunet.onnx $(INSIGHTFACE_OPENCV_YUNET_URL); \
+		echo "$(INSIGHTFACE_OPENCV_YUNET_SHA)  $(INSIGHTFACE_OPENCV_DIR)/yunet.onnx" | sha256sum -c; \
+	fi
+	@if [ "$$(sha256sum $(INSIGHTFACE_OPENCV_DIR)/sface.onnx 2>/dev/null | awk '{print $$1}')" != "$(INSIGHTFACE_OPENCV_SFACE_SHA)" ]; then \
+		echo "Fetching SFace..."; \
+		curl -fsSL -o $(INSIGHTFACE_OPENCV_DIR)/sface.onnx $(INSIGHTFACE_OPENCV_SFACE_URL); \
+		echo "$(INSIGHTFACE_OPENCV_SFACE_SHA)  $(INSIGHTFACE_OPENCV_DIR)/sface.onnx" | sha256sum -c; \
+	fi
 
-backend-assets/grpc/bark-cpp: backend/go/bark/libbark.a backend-assets/grpc
-	CGO_LDFLAGS="$(CGO_LDFLAGS)" C_INCLUDE_PATH=$(CURDIR)/backend/go/bark/ LIBRARY_PATH=$(CURDIR)/backend/go/bark/ \
-	$(GOCMD) build -ldflags "$(LD_FLAGS)" -tags "$(GO_TAGS)" -o backend-assets/grpc/bark-cpp ./backend/go/bark/
-ifneq ($(UPX),)
-	$(UPX) backend-assets/grpc/bark-cpp
-endif
+.PHONY: insightface-antispoof-models
+insightface-antispoof-models:
+	@mkdir -p $(INSIGHTFACE_ANTISPOOF_DIR)
+	@if [ "$$(sha256sum $(INSIGHTFACE_ANTISPOOF_DIR)/MiniFASNetV2.onnx 2>/dev/null | awk '{print $$1}')" != "$(INSIGHTFACE_ANTISPOOF_V2_SHA)" ]; then \
+		echo "Fetching MiniFASNetV2..."; \
+		curl -fsSL -o $(INSIGHTFACE_ANTISPOOF_DIR)/MiniFASNetV2.onnx $(INSIGHTFACE_ANTISPOOF_V2_URL); \
+		echo "$(INSIGHTFACE_ANTISPOOF_V2_SHA)  $(INSIGHTFACE_ANTISPOOF_DIR)/MiniFASNetV2.onnx" | sha256sum -c; \
+	fi
+	@if [ "$$(sha256sum $(INSIGHTFACE_ANTISPOOF_DIR)/MiniFASNetV1SE.onnx 2>/dev/null | awk '{print $$1}')" != "$(INSIGHTFACE_ANTISPOOF_V1SE_SHA)" ]; then \
+		echo "Fetching MiniFASNetV1SE..."; \
+		curl -fsSL -o $(INSIGHTFACE_ANTISPOOF_DIR)/MiniFASNetV1SE.onnx $(INSIGHTFACE_ANTISPOOF_V1SE_URL); \
+		echo "$(INSIGHTFACE_ANTISPOOF_V1SE_SHA)  $(INSIGHTFACE_ANTISPOOF_DIR)/MiniFASNetV1SE.onnx" | sha256sum -c; \
+	fi
 
-backend-assets/grpc/piper: sources/go-piper sources/go-piper/libpiper_binding.a backend-assets/grpc backend-assets/espeak-ng-data
-	CGO_CXXFLAGS="$(PIPER_CGO_CXXFLAGS)" CGO_LDFLAGS="$(PIPER_CGO_LDFLAGS)" LIBRARY_PATH=$(CURDIR)/sources/go-piper \
-	$(GOCMD) build -ldflags "$(LD_FLAGS)" -tags "$(GO_TAGS)" -o backend-assets/grpc/piper ./backend/go/tts/
-ifneq ($(UPX),)
-	$(UPX) backend-assets/grpc/piper
-endif
+.PHONY: insightface-buffalo-sc-models
+insightface-buffalo-sc-models:
+	@mkdir -p $(INSIGHTFACE_BUFFALO_SC_DIR)
+	@if [ "$$(sha256sum $(INSIGHTFACE_BUFFALO_SC_DIR)/buffalo_sc.zip 2>/dev/null | awk '{print $$1}')" != "$(INSIGHTFACE_BUFFALO_SC_SHA)" ]; then \
+		echo "Fetching buffalo_sc..."; \
+		curl -fsSL -o $(INSIGHTFACE_BUFFALO_SC_DIR)/buffalo_sc.zip $(INSIGHTFACE_BUFFALO_SC_URL); \
+		echo "$(INSIGHTFACE_BUFFALO_SC_SHA)  $(INSIGHTFACE_BUFFALO_SC_DIR)/buffalo_sc.zip" | sha256sum -c; \
+		rm -f $(INSIGHTFACE_BUFFALO_SC_DIR)/*.onnx; \
+	fi
+	@if [ ! -f "$(INSIGHTFACE_BUFFALO_SC_DIR)/det_500m.onnx" ]; then \
+		echo "Extracting buffalo_sc..."; \
+		unzip -o -q $(INSIGHTFACE_BUFFALO_SC_DIR)/buffalo_sc.zip -d $(INSIGHTFACE_BUFFALO_SC_DIR); \
+	fi
 
-backend-assets/grpc/silero-vad: backend-assets/grpc backend-assets/lib/libonnxruntime.so.1
-	CGO_LDFLAGS="$(CGO_LDFLAGS)" CPATH="$(CPATH):$(CURDIR)/sources/onnxruntime/include/" LIBRARY_PATH=$(CURDIR)/backend-assets/lib \
-	$(GOCMD) build -ldflags "$(LD_FLAGS)" -tags "$(GO_TAGS)" -o backend-assets/grpc/silero-vad ./backend/go/vad/silero
-ifneq ($(UPX),)
-	$(UPX) backend-assets/grpc/silero-vad
-endif
+## buffalo_sc — smallest insightface pack (SCRFD-500MF detector + MBF
+## recognizer, ~16MB). Exercises the insightface engine code path
+## (model_zoo-backed inference) without the ~326MB buffalo_l download.
+## No age/gender/landmark heads — face_analyze is dropped from caps.
+## The pack is pre-fetched on the host and passed as `root:<dir>` since
+## the e2e suite drives LoadModel directly without going through
+## LocalAI's gallery flow (which is what would normally populate
+## ModelPath and in turn the engine's `_model_dir` option).
+test-extra-backend-insightface-buffalo-sc: docker-build-insightface insightface-buffalo-sc-models insightface-antispoof-models
+	BACKEND_IMAGE=local-ai-backend:insightface \
+	BACKEND_TEST_MODEL_NAME=insightface-buffalo-sc \
+	BACKEND_TEST_OPTIONS=engine:insightface,model_pack:buffalo_sc,root:$(INSIGHTFACE_BUFFALO_SC_DIR),antispoof_v2_onnx:$(INSIGHTFACE_ANTISPOOF_DIR)/MiniFASNetV2.onnx,antispoof_v1se_onnx:$(INSIGHTFACE_ANTISPOOF_DIR)/MiniFASNetV1SE.onnx \
+	BACKEND_TEST_CAPS=health,load,face_detect,face_embed,face_verify,face_antispoof \
+	BACKEND_TEST_FACE_IMAGE_1_URL=$(FACE_IMAGE_1_URL) \
+	BACKEND_TEST_FACE_IMAGE_2_URL=$(FACE_IMAGE_2_URL) \
+	BACKEND_TEST_FACE_IMAGE_3_URL=$(FACE_IMAGE_3_URL) \
+	BACKEND_TEST_FACE_SPOOF_IMAGE_URL=$(FACE_SPOOF_IMAGE_URL) \
+	BACKEND_TEST_VERIFY_DISTANCE_CEILING=0.55 \
+	$(MAKE) test-extra-backend
 
-backend-assets/grpc/whisper: sources/whisper.cpp sources/whisper.cpp/build/src/libwhisper.a backend-assets/grpc
-	CGO_LDFLAGS="$(CGO_LDFLAGS) $(CGO_LDFLAGS_WHISPER)" C_INCLUDE_PATH="${WHISPER_INCLUDE_PATH}" LIBRARY_PATH="${WHISPER_LIBRARY_PATH}" LD_LIBRARY_PATH="${WHISPER_LIBRARY_PATH}" \
-	$(GOCMD) build -ldflags "$(LD_FLAGS)" -tags "$(GO_TAGS)" -o backend-assets/grpc/whisper ./backend/go/transcribe/whisper
-ifneq ($(UPX),)
-	$(UPX) backend-assets/grpc/whisper
-endif
+## OpenCV Zoo YuNet + SFace — Apache 2.0, commercial-safe. face_analyze
+## cap is dropped (SFace has no demographic head). The ONNX files are
+## pre-fetched on the host via the insightface-opencv-models target and
+## passed as absolute paths, since the e2e suite drives LoadModel
+## directly without going through LocalAI's gallery flow.
+test-extra-backend-insightface-opencv: docker-build-insightface insightface-opencv-models insightface-antispoof-models
+	BACKEND_IMAGE=local-ai-backend:insightface \
+	BACKEND_TEST_MODEL_NAME=insightface-opencv \
+	BACKEND_TEST_OPTIONS=engine:onnx_direct,detector_onnx:$(INSIGHTFACE_OPENCV_DIR)/yunet.onnx,recognizer_onnx:$(INSIGHTFACE_OPENCV_DIR)/sface.onnx,antispoof_v2_onnx:$(INSIGHTFACE_ANTISPOOF_DIR)/MiniFASNetV2.onnx,antispoof_v1se_onnx:$(INSIGHTFACE_ANTISPOOF_DIR)/MiniFASNetV1SE.onnx \
+	BACKEND_TEST_CAPS=health,load,face_detect,face_embed,face_verify,face_antispoof \
+	BACKEND_TEST_FACE_IMAGE_1_URL=$(FACE_IMAGE_1_URL) \
+	BACKEND_TEST_FACE_IMAGE_2_URL=$(FACE_IMAGE_2_URL) \
+	BACKEND_TEST_FACE_IMAGE_3_URL=$(FACE_IMAGE_3_URL) \
+	BACKEND_TEST_FACE_SPOOF_IMAGE_URL=$(FACE_SPOOF_IMAGE_URL) \
+	BACKEND_TEST_VERIFY_DISTANCE_CEILING=0.55 \
+	$(MAKE) test-extra-backend
 
-backend-assets/grpc/local-store: backend-assets/grpc
-	$(GOCMD) build -ldflags "$(LD_FLAGS)" -tags "$(GO_TAGS)" -o backend-assets/grpc/local-store ./backend/go/stores/
-ifneq ($(UPX),)
-	$(UPX) backend-assets/grpc/local-store
-endif
+## Aggregate — runs both face-recognition model configurations so CI
+## catches regressions across engines together.
+test-extra-backend-insightface-all: \
+	test-extra-backend-insightface-buffalo-sc \
+	test-extra-backend-insightface-opencv
 
-grpcs: prepare $(GRPC_BACKENDS)
+## speaker-recognition — voice (speaker) biometrics.
+##
+## Audio fixtures default to the speechbrain test samples served
+## straight from their GitHub repo — public, no auth needed, and they
+## ship as 16kHz mono WAV/FLAC which is exactly what the engine wants.
+## example{1,2,5} are three different speakers; the suite treats
+## example1 as the "same-image twin" probe (verify(clip, clip) must
+## return distance≈0) and the other two as cross-speaker ceilings.
+## Override with BACKEND_TEST_VOICE_AUDIO_{1,2,3}_FILE for offline runs.
+VOICE_AUDIO_1_URL ?= https://github.com/speechbrain/speechbrain/raw/develop/tests/samples/single-mic/example1.wav
+VOICE_AUDIO_2_URL ?= https://github.com/speechbrain/speechbrain/raw/develop/tests/samples/single-mic/example2.flac
+VOICE_AUDIO_3_URL ?= https://github.com/speechbrain/speechbrain/raw/develop/tests/samples/single-mic/example5.wav
+
+## ECAPA-TDNN via SpeechBrain — default CI configuration. Auto-downloads
+## the checkpoint from HuggingFace on first LoadModel (bundled in the
+## backend image pip install). 192-d embeddings, cosine-distance based.
+## The e2e suite drives LoadModel directly so we don't rely on LocalAI's
+## gallery flow here.
+test-extra-backend-speaker-recognition-ecapa: docker-build-speaker-recognition
+	BACKEND_IMAGE=local-ai-backend:speaker-recognition \
+	BACKEND_TEST_MODEL_NAME=speechbrain/spkrec-ecapa-voxceleb \
+	BACKEND_TEST_OPTIONS=engine:speechbrain,source:speechbrain/spkrec-ecapa-voxceleb \
+	BACKEND_TEST_CAPS=health,load,voice_embed,voice_verify \
+	BACKEND_TEST_VOICE_AUDIO_1_URL=$(VOICE_AUDIO_1_URL) \
+	BACKEND_TEST_VOICE_AUDIO_2_URL=$(VOICE_AUDIO_2_URL) \
+	BACKEND_TEST_VOICE_AUDIO_3_URL=$(VOICE_AUDIO_3_URL) \
+	BACKEND_TEST_VOICE_VERIFY_DISTANCE_CEILING=0.4 \
+	$(MAKE) test-extra-backend
+
+## Aggregate — today there's only one voice config; the target exists
+## so the CI workflow matches the insightface-all naming convention and
+## can grow to include WeSpeaker / 3D-Speaker later.
+test-extra-backend-speaker-recognition-all: \
+	test-extra-backend-speaker-recognition-ecapa
+
+## Realtime e2e with sherpa-onnx driving VAD + STT + TTS against a mocked
+## LLM. Extracts the sherpa-onnx Docker image rootfs, downloads the three
+## gallery-referenced model bundles (silero-vad, omnilingual-asr, vits-ljs),
+## writes the corresponding model config YAMLs, and runs the realtime
+## websocket spec in tests/e2e with REALTIME_* env vars wiring the sherpa
+## slots into the pipeline. The LLM slot stays on the in-repo mock-backend
+## registered unconditionally by tests/e2e/e2e_suite_test.go. See
+## tests/e2e/run-realtime-sherpa.sh for the full orchestration.
+test-extra-e2e-realtime-sherpa: build-mock-backend docker-build-sherpa-onnx protogen-go react-ui
+	bash tests/e2e/run-realtime-sherpa.sh
+
+## Streaming ASR via the sherpa-onnx online recognizer. Uses the streaming
+## zipformer English model (encoder/decoder/joiner int8 + tokens) from the
+## sherpa-onnx gallery entry. Drives both AudioTranscription and
+## AudioTranscriptionStream via the e2e-backends gRPC harness; streaming
+## emits real partial deltas during decode. Each file is renamed on download
+## to the shape sherpa-onnx's online loader expects (encoder.int8.onnx etc.).
+test-extra-backend-sherpa-onnx-transcription: docker-build-sherpa-onnx
+	BACKEND_IMAGE=local-ai-backend:sherpa-onnx \
+	BACKEND_TEST_MODEL_URL='https://huggingface.co/csukuangfj/sherpa-onnx-streaming-zipformer-en-2023-06-26/resolve/main/encoder-epoch-99-avg-1-chunk-16-left-128.int8.onnx#encoder.int8.onnx' \
+	BACKEND_TEST_EXTRA_FILES='https://huggingface.co/csukuangfj/sherpa-onnx-streaming-zipformer-en-2023-06-26/resolve/main/decoder-epoch-99-avg-1-chunk-16-left-128.int8.onnx#decoder.int8.onnx|https://huggingface.co/csukuangfj/sherpa-onnx-streaming-zipformer-en-2023-06-26/resolve/main/joiner-epoch-99-avg-1-chunk-16-left-128.int8.onnx#joiner.int8.onnx|https://huggingface.co/csukuangfj/sherpa-onnx-streaming-zipformer-en-2023-06-26/resolve/main/tokens.txt' \
+	BACKEND_TEST_AUDIO_URL=https://github.com/ggml-org/whisper.cpp/raw/master/samples/jfk.wav \
+	BACKEND_TEST_CAPS=health,load,transcription \
+	BACKEND_TEST_OPTIONS=subtype=online \
+	$(MAKE) test-extra-backend
+
+## VITS TTS via the sherpa-onnx backend. Pulls the individual files from
+## HuggingFace (the vits-ljs release tarball lives on the k2-fsa github
+## but is also mirrored as discrete files on HF). Exercises both
+## TTS (write-to-file) and TTSStream (PCM chunks + WAV header) via the
+## e2e-backends gRPC harness.
+test-extra-backend-sherpa-onnx-tts: docker-build-sherpa-onnx
+	BACKEND_IMAGE=local-ai-backend:sherpa-onnx \
+	BACKEND_TEST_MODEL_URL='https://huggingface.co/csukuangfj/vits-ljs/resolve/main/vits-ljs.onnx#vits-ljs.onnx' \
+	BACKEND_TEST_EXTRA_FILES='https://huggingface.co/csukuangfj/vits-ljs/resolve/main/tokens.txt|https://huggingface.co/csukuangfj/vits-ljs/resolve/main/lexicon.txt' \
+	BACKEND_TEST_CAPS=health,load,tts \
+	$(MAKE) test-extra-backend
+
+## VibeVoice TTS via the vibevoice-cpp backend. ModelFile is the
+## realtime gguf; the supplementary tokenizer + voice prompt land
+## alongside it under the harness's models dir and are wired through
+## via the standard Options[] convention (tokenizer=, voice=).
+test-extra-backend-vibevoice-cpp-tts: docker-build-vibevoice-cpp
+	BACKEND_IMAGE=local-ai-backend:vibevoice-cpp \
+	BACKEND_TEST_MODEL_URL='https://huggingface.co/mudler/vibevoice.cpp-models/resolve/main/vibevoice-realtime-0.5B-q8_0.gguf#vibevoice-realtime-0.5B-q8_0.gguf' \
+	BACKEND_TEST_EXTRA_FILES='https://huggingface.co/mudler/vibevoice.cpp-models/resolve/main/tokenizer.gguf#tokenizer.gguf|https://huggingface.co/mudler/vibevoice.cpp-models/resolve/main/voice-en-Carter_man.gguf#voice-en-Carter_man.gguf' \
+	BACKEND_TEST_OPTIONS=tokenizer:tokenizer.gguf,voice:voice-en-Carter_man.gguf \
+	BACKEND_TEST_CAPS=health,load,tts \
+	$(MAKE) test-extra-backend
+
+## VibeVoice ASR (long-form, with diarization). type=asr tells the
+## backend's Load() to slot ModelFile into the asr_model role; the
+## tokenizer is supplied via Options[]. Uses the Q4_K quant (~10 GB)
+## rather than Q8_0 (~14 GB) so the bundle fits inside ubuntu-latest's
+## post-image disk budget.
+test-extra-backend-vibevoice-cpp-transcription: docker-build-vibevoice-cpp
+	BACKEND_IMAGE=local-ai-backend:vibevoice-cpp \
+	BACKEND_TEST_MODEL_URL='https://huggingface.co/mudler/vibevoice.cpp-models/resolve/main/vibevoice-asr-q4_k.gguf#vibevoice-asr-q4_k.gguf' \
+	BACKEND_TEST_EXTRA_FILES='https://huggingface.co/mudler/vibevoice.cpp-models/resolve/main/tokenizer.gguf#tokenizer.gguf' \
+	BACKEND_TEST_AUDIO_URL=https://github.com/ggml-org/whisper.cpp/raw/master/samples/jfk.wav \
+	BACKEND_TEST_OPTIONS=type:asr,tokenizer:tokenizer.gguf \
+	BACKEND_TEST_CAPS=health,load,transcription \
+	$(MAKE) test-extra-backend
+
+## sglang mirrors the vllm setup: HuggingFace model id, same tiny Qwen,
+## tool-call extraction via sglang's native qwen parser. CPU builds use
+## sglang's upstream pyproject_cpu.toml recipe (see backend/python/sglang/install.sh).
+test-extra-backend-sglang: docker-build-sglang
+	BACKEND_IMAGE=local-ai-backend:sglang \
+	BACKEND_TEST_MODEL_NAME=Qwen/Qwen2.5-0.5B-Instruct \
+	BACKEND_TEST_CAPS=health,load,predict,stream,tools \
+	BACKEND_TEST_OPTIONS=tool_parser:qwen \
+	$(MAKE) test-extra-backend
+
+
+## mlx is Apple-Silicon-first — the MLX backend auto-detects the right tool
+## parser from the chat template, so no tool_parser: option is needed (it
+## would be ignored at runtime). Run this on macOS / arm64 with Metal; the
+## Linux/CPU mlx variant is untested in CI.
+test-extra-backend-mlx: docker-build-mlx
+	BACKEND_IMAGE=local-ai-backend:mlx \
+	BACKEND_TEST_MODEL_NAME=mlx-community/Qwen2.5-0.5B-Instruct-4bit \
+	BACKEND_TEST_CAPS=health,load,predict,stream,tools \
+	$(MAKE) test-extra-backend
+
+test-extra-backend-mlx-vlm: docker-build-mlx-vlm
+	BACKEND_IMAGE=local-ai-backend:mlx-vlm \
+	BACKEND_TEST_MODEL_NAME=mlx-community/Qwen2.5-0.5B-Instruct-4bit \
+	BACKEND_TEST_CAPS=health,load,predict,stream,tools \
+	$(MAKE) test-extra-backend
 
 DOCKER_IMAGE?=local-ai
-DOCKER_AIO_IMAGE?=local-ai-aio
 IMAGE_TYPE?=core
-BASE_IMAGE?=ubuntu:22.04
+BASE_IMAGE?=ubuntu:24.04
 
 docker:
 	docker build \
@@ -816,51 +897,264 @@ docker:
 		--build-arg GO_TAGS="$(GO_TAGS)" \
 		--build-arg MAKEFLAGS="$(DOCKER_MAKEFLAGS)" \
 		--build-arg BUILD_TYPE=$(BUILD_TYPE) \
+		--build-arg CUDA_MAJOR_VERSION=$(CUDA_MAJOR_VERSION) \
+		--build-arg CUDA_MINOR_VERSION=$(CUDA_MINOR_VERSION) \
+		--build-arg UBUNTU_VERSION=$(UBUNTU_VERSION) \
+		--build-arg UBUNTU_CODENAME=$(UBUNTU_CODENAME) \
 		-t $(DOCKER_IMAGE) .
 
-docker-cuda11:
+docker-cuda12:
 	docker build \
-		--build-arg CUDA_MAJOR_VERSION=11 \
-		--build-arg CUDA_MINOR_VERSION=8 \
+		--build-arg CUDA_MAJOR_VERSION=${CUDA_MAJOR_VERSION} \
+		--build-arg CUDA_MINOR_VERSION=${CUDA_MINOR_VERSION} \
 		--build-arg BASE_IMAGE=$(BASE_IMAGE) \
 		--build-arg IMAGE_TYPE=$(IMAGE_TYPE) \
 		--build-arg GO_TAGS="$(GO_TAGS)" \
 		--build-arg MAKEFLAGS="$(DOCKER_MAKEFLAGS)" \
 		--build-arg BUILD_TYPE=$(BUILD_TYPE) \
-		-t $(DOCKER_IMAGE)-cuda11 .
-
-docker-aio:
-	@echo "Building AIO image with base $(BASE_IMAGE) as $(DOCKER_AIO_IMAGE)"
-	docker build \
-		--build-arg BASE_IMAGE=$(BASE_IMAGE) \
-		--build-arg MAKEFLAGS="$(DOCKER_MAKEFLAGS)" \
-		-t $(DOCKER_AIO_IMAGE) -f Dockerfile.aio .
-
-docker-aio-all:
-	$(MAKE) docker-aio DOCKER_AIO_SIZE=cpu
-	$(MAKE) docker-aio DOCKER_AIO_SIZE=cpu
+		--build-arg UBUNTU_VERSION=$(UBUNTU_VERSION) \
+		--build-arg UBUNTU_CODENAME=$(UBUNTU_CODENAME) \
+		-t $(DOCKER_IMAGE)-cuda-12 .
 
 docker-image-intel:
 	docker build \
-		--progress plain \
-		--build-arg BASE_IMAGE=intel/oneapi-basekit:2025.1.0-0-devel-ubuntu24.04 \
+		--build-arg BASE_IMAGE=intel/oneapi-basekit:2025.3.2-0-devel-ubuntu24.04 \
 		--build-arg IMAGE_TYPE=$(IMAGE_TYPE) \
-		--build-arg GO_TAGS="none" \
+		--build-arg GO_TAGS="$(GO_TAGS)" \
 		--build-arg MAKEFLAGS="$(DOCKER_MAKEFLAGS)" \
-		--build-arg BUILD_TYPE=sycl_f32 -t $(DOCKER_IMAGE) .
+		--build-arg BUILD_TYPE=intel \
+		--build-arg CUDA_MAJOR_VERSION=$(CUDA_MAJOR_VERSION) \
+		--build-arg CUDA_MINOR_VERSION=$(CUDA_MINOR_VERSION) \
+		--build-arg UBUNTU_VERSION=$(UBUNTU_VERSION) \
+		--build-arg UBUNTU_CODENAME=$(UBUNTU_CODENAME) \
+		-t $(DOCKER_IMAGE) .
 
-docker-image-intel-xpu:
-	docker build \
-		--build-arg BASE_IMAGE=intel/oneapi-basekit:2025.1.0-0-devel-ubuntu22.04 \
-		--build-arg IMAGE_TYPE=$(IMAGE_TYPE) \
-		--build-arg GO_TAGS="none" \
-		--build-arg MAKEFLAGS="$(DOCKER_MAKEFLAGS)" \
-		--build-arg BUILD_TYPE=sycl_f32 -t $(DOCKER_IMAGE) .
+########################################################
+## Backends
+########################################################
+
+# Pattern rule for standard backends (docker-based)
+# This matches all backends that use docker-build-* and docker-save-*
+backends/%: docker-build-% docker-save-% build
+	./local-ai backends install "ocifile://$(abspath ./backend-images/$*.tar)"
+
+# Darwin-specific backends (keep as explicit targets since they have special build logic)
+backends/llama-cpp-darwin: build
+	bash ./scripts/build/llama-cpp-darwin.sh
+	./local-ai backends install "ocifile://$(abspath ./backend-images/llama-cpp.tar)"
+
+build-darwin-python-backend: build
+	bash ./scripts/build/python-darwin.sh
+
+build-darwin-go-backend: build
+	bash ./scripts/build/golang-darwin.sh
+
+backends/mlx:
+	BACKEND=mlx $(MAKE) build-darwin-python-backend
+	./local-ai backends install "ocifile://$(abspath ./backend-images/mlx.tar)"
+
+backends/diffuser-darwin:
+	BACKEND=diffusers $(MAKE) build-darwin-python-backend
+	./local-ai backends install "ocifile://$(abspath ./backend-images/diffusers.tar)"
+
+backends/mlx-vlm:
+	BACKEND=mlx-vlm $(MAKE) build-darwin-python-backend
+	./local-ai backends install "ocifile://$(abspath ./backend-images/mlx-vlm.tar)"
+
+backends/mlx-audio:
+	BACKEND=mlx-audio $(MAKE) build-darwin-python-backend
+	./local-ai backends install "ocifile://$(abspath ./backend-images/mlx-audio.tar)"
+
+backends/mlx-distributed:
+	BACKEND=mlx-distributed $(MAKE) build-darwin-python-backend
+	./local-ai backends install "ocifile://$(abspath ./backend-images/mlx-distributed.tar)"
+
+backends/stablediffusion-ggml-darwin:
+	BACKEND=stablediffusion-ggml BUILD_TYPE=metal $(MAKE) build-darwin-go-backend
+	./local-ai backends install "ocifile://$(abspath ./backend-images/stablediffusion-ggml.tar)"
+
+backend-images:
+	mkdir -p backend-images
+
+# Backend metadata: BACKEND_NAME | DOCKERFILE_TYPE | BUILD_CONTEXT | PROGRESS_FLAG | NEEDS_BACKEND_ARG
+# llama-cpp is special - uses llama-cpp Dockerfile and doesn't need BACKEND arg
+BACKEND_LLAMA_CPP = llama-cpp|llama-cpp|.|false|false
+# ik-llama-cpp is a fork of llama.cpp with superior CPU performance
+BACKEND_IK_LLAMA_CPP = ik-llama-cpp|ik-llama-cpp|.|false|false
+# turboquant is a llama.cpp fork with TurboQuant KV-cache quantization.
+# Reuses backend/cpp/llama-cpp grpc-server sources via a thin wrapper Makefile.
+BACKEND_TURBOQUANT = turboquant|turboquant|.|false|false
+
+# Golang backends
+BACKEND_PIPER = piper|golang|.|false|true
+BACKEND_LOCAL_STORE = local-store|golang|.|false|true
+BACKEND_HUGGINGFACE = huggingface|golang|.|false|true
+BACKEND_SILERO_VAD = silero-vad|golang|.|false|true
+BACKEND_STABLEDIFFUSION_GGML = stablediffusion-ggml|golang|.|--progress=plain|true
+BACKEND_WHISPER = whisper|golang|.|false|true
+BACKEND_VOXTRAL = voxtral|golang|.|false|true
+BACKEND_ACESTEP_CPP = acestep-cpp|golang|.|false|true
+BACKEND_QWEN3_TTS_CPP = qwen3-tts-cpp|golang|.|false|true
+BACKEND_VIBEVOICE_CPP = vibevoice-cpp|golang|.|false|true
+BACKEND_OPUS = opus|golang|.|false|true
+BACKEND_SHERPA_ONNX = sherpa-onnx|golang|.|false|true
+
+# Python backends with root context
+BACKEND_RERANKERS = rerankers|python|.|false|true
+BACKEND_TRANSFORMERS = transformers|python|.|false|true
+BACKEND_OUTETTS = outetts|python|.|false|true
+BACKEND_FASTER_WHISPER = faster-whisper|python|.|false|true
+BACKEND_COQUI = coqui|python|.|false|true
+BACKEND_RFDETR = rfdetr|python|.|false|true
+BACKEND_INSIGHTFACE = insightface|python|.|false|true
+BACKEND_SPEAKER_RECOGNITION = speaker-recognition|python|.|false|true
+BACKEND_KITTEN_TTS = kitten-tts|python|.|false|true
+BACKEND_NEUTTS = neutts|python|.|false|true
+BACKEND_KOKORO = kokoro|python|.|false|true
+BACKEND_VLLM = vllm|python|.|false|true
+BACKEND_VLLM_OMNI = vllm-omni|python|.|false|true
+BACKEND_SGLANG = sglang|python|.|false|true
+BACKEND_DIFFUSERS = diffusers|python|.|--progress=plain|true
+BACKEND_CHATTERBOX = chatterbox|python|.|false|true
+BACKEND_VIBEVOICE = vibevoice|python|.|--progress=plain|true
+BACKEND_MOONSHINE = moonshine|python|.|false|true
+BACKEND_POCKET_TTS = pocket-tts|python|.|false|true
+BACKEND_QWEN_TTS = qwen-tts|python|.|false|true
+BACKEND_FISH_SPEECH = fish-speech|python|.|false|true
+BACKEND_FASTER_QWEN3_TTS = faster-qwen3-tts|python|.|false|true
+BACKEND_QWEN_ASR = qwen-asr|python|.|false|true
+BACKEND_NEMO = nemo|python|.|false|true
+BACKEND_VOXCPM = voxcpm|python|.|false|true
+BACKEND_WHISPERX = whisperx|python|.|false|true
+BACKEND_ACE_STEP = ace-step|python|.|false|true
+BACKEND_MLX = mlx|python|.|false|true
+BACKEND_MLX_VLM = mlx-vlm|python|.|false|true
+BACKEND_MLX_DISTRIBUTED = mlx-distributed|python|./|false|true
+BACKEND_TRL = trl|python|.|false|true
+BACKEND_LLAMA_CPP_QUANTIZATION = llama-cpp-quantization|python|.|false|true
+BACKEND_TINYGRAD = tinygrad|python|.|false|true
+
+# Rust backends
+BACKEND_KOKOROS = kokoros|rust|.|false|true
+
+# C++ backends (Go wrapper with purego)
+BACKEND_SAM3_CPP = sam3-cpp|golang|.|false|true
+
+# Helper function to build docker image for a backend
+# Usage: $(call docker-build-backend,BACKEND_NAME,DOCKERFILE_TYPE,BUILD_CONTEXT,PROGRESS_FLAG,NEEDS_BACKEND_ARG)
+define docker-build-backend
+	docker build $(if $(filter-out false,$(4)),$(4)) \
+		--build-arg BUILD_TYPE=$(BUILD_TYPE) \
+		--build-arg BASE_IMAGE=$(BASE_IMAGE) \
+		--build-arg CUDA_MAJOR_VERSION=$(CUDA_MAJOR_VERSION) \
+		--build-arg CUDA_MINOR_VERSION=$(CUDA_MINOR_VERSION) \
+		--build-arg UBUNTU_VERSION=$(UBUNTU_VERSION) \
+		--build-arg UBUNTU_CODENAME=$(UBUNTU_CODENAME) \
+		$(if $(FROM_SOURCE),--build-arg FROM_SOURCE=$(FROM_SOURCE)) \
+		$(if $(filter true,$(5)),--build-arg BACKEND=$(1)) \
+		-t local-ai-backend:$(1) -f backend/Dockerfile.$(2) $(3)
+endef
+
+# Generate docker-build targets from backend definitions
+define generate-docker-build-target
+docker-build-$(word 1,$(subst |, ,$(1))):
+	$$(call docker-build-backend,$(word 1,$(subst |, ,$(1))),$(word 2,$(subst |, ,$(1))),$(word 3,$(subst |, ,$(1))),$(word 4,$(subst |, ,$(1))),$(word 5,$(subst |, ,$(1))))
+endef
+
+# Generate all docker-build targets
+$(eval $(call generate-docker-build-target,$(BACKEND_LLAMA_CPP)))
+$(eval $(call generate-docker-build-target,$(BACKEND_IK_LLAMA_CPP)))
+$(eval $(call generate-docker-build-target,$(BACKEND_TURBOQUANT)))
+$(eval $(call generate-docker-build-target,$(BACKEND_PIPER)))
+$(eval $(call generate-docker-build-target,$(BACKEND_LOCAL_STORE)))
+$(eval $(call generate-docker-build-target,$(BACKEND_HUGGINGFACE)))
+$(eval $(call generate-docker-build-target,$(BACKEND_SILERO_VAD)))
+$(eval $(call generate-docker-build-target,$(BACKEND_STABLEDIFFUSION_GGML)))
+$(eval $(call generate-docker-build-target,$(BACKEND_WHISPER)))
+$(eval $(call generate-docker-build-target,$(BACKEND_VOXTRAL)))
+$(eval $(call generate-docker-build-target,$(BACKEND_OPUS)))
+$(eval $(call generate-docker-build-target,$(BACKEND_RERANKERS)))
+$(eval $(call generate-docker-build-target,$(BACKEND_TRANSFORMERS)))
+$(eval $(call generate-docker-build-target,$(BACKEND_OUTETTS)))
+$(eval $(call generate-docker-build-target,$(BACKEND_FASTER_WHISPER)))
+$(eval $(call generate-docker-build-target,$(BACKEND_COQUI)))
+$(eval $(call generate-docker-build-target,$(BACKEND_RFDETR)))
+$(eval $(call generate-docker-build-target,$(BACKEND_INSIGHTFACE)))
+$(eval $(call generate-docker-build-target,$(BACKEND_SPEAKER_RECOGNITION)))
+$(eval $(call generate-docker-build-target,$(BACKEND_KITTEN_TTS)))
+$(eval $(call generate-docker-build-target,$(BACKEND_NEUTTS)))
+$(eval $(call generate-docker-build-target,$(BACKEND_KOKORO)))
+$(eval $(call generate-docker-build-target,$(BACKEND_VLLM)))
+$(eval $(call generate-docker-build-target,$(BACKEND_VLLM_OMNI)))
+$(eval $(call generate-docker-build-target,$(BACKEND_SGLANG)))
+$(eval $(call generate-docker-build-target,$(BACKEND_DIFFUSERS)))
+$(eval $(call generate-docker-build-target,$(BACKEND_CHATTERBOX)))
+$(eval $(call generate-docker-build-target,$(BACKEND_VIBEVOICE)))
+$(eval $(call generate-docker-build-target,$(BACKEND_MOONSHINE)))
+$(eval $(call generate-docker-build-target,$(BACKEND_POCKET_TTS)))
+$(eval $(call generate-docker-build-target,$(BACKEND_QWEN_TTS)))
+$(eval $(call generate-docker-build-target,$(BACKEND_FISH_SPEECH)))
+$(eval $(call generate-docker-build-target,$(BACKEND_FASTER_QWEN3_TTS)))
+$(eval $(call generate-docker-build-target,$(BACKEND_QWEN_ASR)))
+$(eval $(call generate-docker-build-target,$(BACKEND_NEMO)))
+$(eval $(call generate-docker-build-target,$(BACKEND_VOXCPM)))
+$(eval $(call generate-docker-build-target,$(BACKEND_WHISPERX)))
+$(eval $(call generate-docker-build-target,$(BACKEND_ACE_STEP)))
+$(eval $(call generate-docker-build-target,$(BACKEND_ACESTEP_CPP)))
+$(eval $(call generate-docker-build-target,$(BACKEND_QWEN3_TTS_CPP)))
+$(eval $(call generate-docker-build-target,$(BACKEND_VIBEVOICE_CPP)))
+$(eval $(call generate-docker-build-target,$(BACKEND_MLX)))
+$(eval $(call generate-docker-build-target,$(BACKEND_MLX_VLM)))
+$(eval $(call generate-docker-build-target,$(BACKEND_MLX_DISTRIBUTED)))
+$(eval $(call generate-docker-build-target,$(BACKEND_TRL)))
+$(eval $(call generate-docker-build-target,$(BACKEND_LLAMA_CPP_QUANTIZATION)))
+$(eval $(call generate-docker-build-target,$(BACKEND_TINYGRAD)))
+$(eval $(call generate-docker-build-target,$(BACKEND_KOKOROS)))
+$(eval $(call generate-docker-build-target,$(BACKEND_SAM3_CPP)))
+$(eval $(call generate-docker-build-target,$(BACKEND_SHERPA_ONNX)))
+
+# Pattern rule for docker-save targets
+docker-save-%: backend-images
+	docker save local-ai-backend:$* -o backend-images/$*.tar
+
+docker-build-backends: docker-build-llama-cpp docker-build-ik-llama-cpp docker-build-turboquant docker-build-rerankers docker-build-vllm docker-build-vllm-omni docker-build-sglang docker-build-transformers docker-build-outetts docker-build-diffusers docker-build-kokoro docker-build-faster-whisper docker-build-coqui docker-build-chatterbox docker-build-vibevoice docker-build-moonshine docker-build-pocket-tts docker-build-qwen-tts docker-build-fish-speech docker-build-faster-qwen3-tts docker-build-qwen-asr docker-build-nemo docker-build-voxcpm docker-build-whisperx docker-build-ace-step docker-build-acestep-cpp docker-build-voxtral docker-build-mlx-distributed docker-build-trl docker-build-llama-cpp-quantization docker-build-tinygrad docker-build-kokoros docker-build-sam3-cpp docker-build-qwen3-tts-cpp docker-build-vibevoice-cpp docker-build-insightface docker-build-speaker-recognition docker-build-sherpa-onnx
+
+########################################################
+### Mock Backend for E2E Tests
+########################################################
+
+build-mock-backend: protogen-go
+	$(GOCMD) build -o tests/e2e/mock-backend/mock-backend ./tests/e2e/mock-backend
+
+clean-mock-backend:
+	rm -f tests/e2e/mock-backend/mock-backend
+
+########################################################
+### UI E2E Test Server
+########################################################
+
+build-ui-test-server: build-mock-backend react-ui protogen-go
+	$(GOCMD) build -o tests/e2e-ui/ui-test-server ./tests/e2e-ui
+
+test-ui-e2e: build-ui-test-server
+	cd core/http/react-ui && npm install && npx playwright install --with-deps chromium && npx playwright test
+
+test-ui-e2e-docker:
+	docker build -t localai-ui-e2e -f tests/e2e-ui/Dockerfile .
+	docker run --rm localai-ui-e2e
+
+clean-ui-test-server:
+	rm -f tests/e2e-ui/ui-test-server
+
+########################################################
+### END Backends
+########################################################
 
 .PHONY: swagger
 swagger:
 	swag init -g core/http/app.go --output swagger
 
+# DEPRECATED: gen-assets is for the legacy Alpine.js UI. Remove when legacy UI is removed.
 .PHONY: gen-assets
 gen-assets:
 	$(GOCMD) run core/dependencies_manager/manager.go webui_static.yaml core/http/static/assets
@@ -882,3 +1176,19 @@ docs-clean:
 .PHONY: docs
 docs: docs/static/gallery.html
 	cd docs && hugo serve
+
+########################################################
+## Platform-specific builds
+########################################################
+
+## fyne cross-platform build
+build-launcher-darwin: build-launcher
+	go run github.com/tiagomelo/macos-dmg-creator/cmd/createdmg@latest \
+	--appName "LocalAI" \
+	--appBinaryPath "$(LAUNCHER_BINARY_NAME)" \
+	--bundleIdentifier "com.localai.launcher" \
+	--iconPath "core/http/static/logo.png" \
+	--outputDir "dist/"
+
+build-launcher-linux:
+	cd cmd/launcher && go run fyne.io/tools/cmd/fyne@latest package -os linux -icon ../../core/http/static/logo.png --executable $(LAUNCHER_BINARY_NAME)-linux && mv launcher.tar.xz ../../$(LAUNCHER_BINARY_NAME)-linux.tar.xz

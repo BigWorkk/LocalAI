@@ -1,37 +1,35 @@
 package openai
 
 import (
-	"bufio"
-	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
 
+	"github.com/labstack/echo/v4"
 	"github.com/mudler/LocalAI/core/backend"
 	"github.com/mudler/LocalAI/core/config"
 	"github.com/mudler/LocalAI/core/http/middleware"
 
-	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
 	"github.com/mudler/LocalAI/core/schema"
+	"github.com/mudler/LocalAI/core/templates"
 	"github.com/mudler/LocalAI/pkg/functions"
 	"github.com/mudler/LocalAI/pkg/model"
-	"github.com/mudler/LocalAI/pkg/templates"
-	"github.com/rs/zerolog/log"
-	"github.com/valyala/fasthttp"
+	"github.com/mudler/xlog"
 )
 
 // CompletionEndpoint is the OpenAI Completion API endpoint https://platform.openai.com/docs/api-reference/completions
 // @Summary Generate completions for a given prompt and model.
+// @Tags inference
 // @Param request body schema.OpenAIRequest true "query params"
 // @Success 200 {object} schema.OpenAIResponse "Response"
 // @Router /v1/completions [post]
-func CompletionEndpoint(cl *config.BackendConfigLoader, ml *model.ModelLoader, evaluator *templates.Evaluator, appConfig *config.ApplicationConfig) func(c *fiber.Ctx) error {
-	created := int(time.Now().Unix())
+func CompletionEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, evaluator *templates.Evaluator, appConfig *config.ApplicationConfig) echo.HandlerFunc {
+	process := func(id string, s string, req *schema.OpenAIRequest, config *config.ModelConfig, loader *model.ModelLoader, responses chan schema.OpenAIResponse, extraUsage bool) error {
+		tokenCallback := func(s string, tokenUsage backend.TokenUsage) bool {
+			created := int(time.Now().Unix())
 
-	process := func(id string, s string, req *schema.OpenAIRequest, config *config.BackendConfig, loader *model.ModelLoader, responses chan schema.OpenAIResponse, extraUsage bool) {
-		ComputeChoices(req, s, config, appConfig, loader, func(s string, c *[]schema.Choice) {}, func(s string, tokenUsage backend.TokenUsage) bool {
 			usage := schema.OpenAIUsage{
 				PromptTokens:     tokenUsage.Prompt,
 				CompletionTokens: tokenUsage.Completion,
@@ -47,34 +45,43 @@ func CompletionEndpoint(cl *config.BackendConfigLoader, ml *model.ModelLoader, e
 				Model:   req.Model, // we have to return what the user sent here, due to OpenAI spec.
 				Choices: []schema.Choice{
 					{
-						Index: 0,
-						Text:  s,
+						Index:        0,
+						Text:         s,
+						FinishReason: nil,
 					},
 				},
 				Object: "text_completion",
 				Usage:  usage,
 			}
-			log.Debug().Msgf("Sending goroutine: %s", s)
+			xlog.Debug("Sending goroutine", "text", s)
 
 			responses <- resp
 			return true
-		})
+		}
+		_, _, _, err := ComputeChoices(req, s, config, cl, appConfig, loader, func(s string, c *[]schema.Choice) {}, tokenCallback)
 		close(responses)
+		return err
 	}
 
-	return func(c *fiber.Ctx) error {
-		// Handle Correlation
-		id := c.Get("X-Correlation-ID", uuid.New().String())
-		extraUsage := c.Get("Extra-Usage", "") != ""
+	return func(c echo.Context) error {
 
-		input, ok := c.Locals(middleware.CONTEXT_LOCALS_KEY_LOCALAI_REQUEST).(*schema.OpenAIRequest)
+		created := int(time.Now().Unix())
+
+		// Handle Correlation
+		id := c.Request().Header.Get("X-Correlation-ID")
+		if id == "" {
+			id = uuid.New().String()
+		}
+		extraUsage := c.Request().Header.Get("Extra-Usage") != ""
+
+		input, ok := c.Get(middleware.CONTEXT_LOCALS_KEY_LOCALAI_REQUEST).(*schema.OpenAIRequest)
 		if !ok || input.Model == "" {
-			return fiber.ErrBadRequest
+			return echo.ErrBadRequest
 		}
 
-		config, ok := c.Locals(middleware.CONTEXT_LOCALS_KEY_MODEL_CONFIG).(*config.BackendConfig)
+		config, ok := c.Get(middleware.CONTEXT_LOCALS_KEY_MODEL_CONFIG).(*config.ModelConfig)
 		if !ok || config == nil {
-			return fiber.ErrBadRequest
+			return echo.ErrBadRequest
 		}
 
 		if config.ResponseFormatMap != nil {
@@ -88,19 +95,14 @@ func CompletionEndpoint(cl *config.BackendConfigLoader, ml *model.ModelLoader, e
 
 		config.Grammar = input.Grammar
 
-		log.Debug().Msgf("Parameter Config: %+v", config)
+		xlog.Debug("Parameter Config", "config", config)
 
 		if input.Stream {
-			log.Debug().Msgf("Stream request received")
-			c.Context().SetContentType("text/event-stream")
-			//c.Response().Header.SetContentType(fiber.MIMETextHTMLCharsetUTF8)
-			//c.Set("Content-Type", "text/event-stream")
-			c.Set("Cache-Control", "no-cache")
-			c.Set("Connection", "keep-alive")
-			c.Set("Transfer-Encoding", "chunked")
-		}
+			xlog.Debug("Stream request received")
+			c.Response().Header().Set("Content-Type", "text/event-stream")
+			c.Response().Header().Set("Cache-Control", "no-cache")
+			c.Response().Header().Set("Connection", "keep-alive")
 
-		if input.Stream {
 			if len(config.PromptStrings) > 1 {
 				return errors.New("cannot handle more than 1 `PromptStrings` when Streaming")
 			}
@@ -108,48 +110,94 @@ func CompletionEndpoint(cl *config.BackendConfigLoader, ml *model.ModelLoader, e
 			predInput := config.PromptStrings[0]
 
 			templatedInput, err := evaluator.EvaluateTemplateForPrompt(templates.CompletionPromptTemplate, *config, templates.PromptTemplateData{
-				Input:        predInput,
-				SystemPrompt: config.SystemPrompt,
+				Input:           predInput,
+				SystemPrompt:    config.SystemPrompt,
+				ReasoningEffort: input.ReasoningEffort,
+				Metadata:        input.Metadata,
 			})
 			if err == nil {
 				predInput = templatedInput
-				log.Debug().Msgf("Template found, input modified to: %s", predInput)
+				xlog.Debug("Template found, input modified", "input", predInput)
 			}
 
 			responses := make(chan schema.OpenAIResponse)
 
-			go process(id, predInput, input, config, ml, responses, extraUsage)
+			ended := make(chan error)
+			go func() {
+				ended <- process(id, predInput, input, config, ml, responses, extraUsage)
+			}()
 
-			c.Context().SetBodyStreamWriter(fasthttp.StreamWriter(func(w *bufio.Writer) {
+		LOOP:
+			for {
+				select {
+				case ev := <-responses:
+					if len(ev.Choices) == 0 {
+						xlog.Debug("No choices in the response, skipping")
+						continue
+					}
+					respData, err := json.Marshal(ev)
+					if err != nil {
+						xlog.Debug("Failed to marshal response", "error", err)
+						continue
+					}
 
-				for ev := range responses {
-					var buf bytes.Buffer
-					enc := json.NewEncoder(&buf)
-					enc.Encode(ev)
+					xlog.Debug("Sending chunk", "chunk", string(respData))
+					_, err = fmt.Fprintf(c.Response().Writer, "data: %s\n\n", string(respData))
+					if err != nil {
+						return err
+					}
+					c.Response().Flush()
+				case err := <-ended:
+					if err == nil {
+						break LOOP
+					}
+					xlog.Error("Stream ended with error", "error", err)
 
-					log.Debug().Msgf("Sending chunk: %s", buf.String())
-					fmt.Fprintf(w, "data: %v\n", buf.String())
-					w.Flush()
-				}
-
-				resp := &schema.OpenAIResponse{
-					ID:      id,
-					Created: created,
-					Model:   input.Model, // we have to return what the user sent here, due to OpenAI spec.
-					Choices: []schema.Choice{
-						{
-							Index:        0,
-							FinishReason: "stop",
+					stopReason := FinishReasonStop
+					errorResp := schema.OpenAIResponse{
+						ID:      id,
+						Created: created,
+						Model:   input.Model,
+						Choices: []schema.Choice{
+							{
+								Index:        0,
+								FinishReason: &stopReason,
+								Text:         "Internal error: " + err.Error(),
+							},
 						},
-					},
-					Object: "text_completion",
+						Object: "text_completion",
+					}
+					errorData, marshalErr := json.Marshal(errorResp)
+					if marshalErr != nil {
+						xlog.Error("Failed to marshal error response", "error", marshalErr)
+						// Send a simple error message as fallback
+						fmt.Fprintf(c.Response().Writer, "data: {\"error\":\"Internal error\"}\n\n")
+					} else {
+						fmt.Fprintf(c.Response().Writer, "data: %s\n\n", string(errorData))
+					}
+					c.Response().Flush()
+					return nil
 				}
-				respData, _ := json.Marshal(resp)
+			}
 
-				w.WriteString(fmt.Sprintf("data: %s\n\n", respData))
-				w.WriteString("data: [DONE]\n\n")
-				w.Flush()
-			}))
+			stopReason := FinishReasonStop
+			resp := &schema.OpenAIResponse{
+				ID:      id,
+				Created: created,
+				Model:   input.Model, // we have to return what the user sent here, due to OpenAI spec.
+				Choices: []schema.Choice{
+					{
+						Index:        0,
+						FinishReason: &stopReason,
+					},
+				},
+				Object: "text_completion",
+			}
+			respData, _ := json.Marshal(resp)
+
+			fmt.Fprintf(c.Response().Writer, "data: %s\n\n", respData)
+			fmt.Fprintf(c.Response().Writer, "data: [DONE]\n\n")
+			c.Response().Flush()
 			return nil
 		}
 
@@ -159,17 +207,20 @@ func CompletionEndpoint(cl *config.BackendConfigLoader, ml *model.ModelLoader, e
 
 		for k, i := range config.PromptStrings {
 			templatedInput, err := evaluator.EvaluateTemplateForPrompt(templates.CompletionPromptTemplate, *config, templates.PromptTemplateData{
-				SystemPrompt: config.SystemPrompt,
-				Input:        i,
+				SystemPrompt:    config.SystemPrompt,
+				Input:           i,
+				ReasoningEffort: input.ReasoningEffort,
+				Metadata:        input.Metadata,
 			})
 			if err == nil {
 				i = templatedInput
-				log.Debug().Msgf("Template found, input modified to: %s", i)
+				xlog.Debug("Template found, input modified", "input", i)
 			}
 
-			r, tokenUsage, err := ComputeChoices(
-				input, i, config, appConfig, ml, func(s string, c *[]schema.Choice) {
-					*c = append(*c, schema.Choice{Text: s, FinishReason: "stop", Index: k})
+			r, tokenUsage, _, err := ComputeChoices(
+				input, i, config, cl, appConfig, ml, func(s string, c *[]schema.Choice) {
+					stopReason := FinishReasonStop
+					*c = append(*c, schema.Choice{Text: s, FinishReason: &stopReason, Index: k})
 				}, nil)
 			if err != nil {
 				return err
@@ -200,9 +251,9 @@ func CompletionEndpoint(cl *config.BackendConfigLoader, ml *model.ModelLoader, e
 		}
 
 		jsonResult, _ := json.Marshal(resp)
-		log.Debug().Msgf("Response: %s", jsonResult)
+		xlog.Debug("Response", "response", string(jsonResult))
 
 		// Return the prediction in the response body
-		return c.JSON(resp)
+		return c.JSON(200, resp)
 	}
 }

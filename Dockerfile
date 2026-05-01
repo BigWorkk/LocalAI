@@ -1,120 +1,32 @@
-ARG IMAGE_TYPE=extras
-ARG BASE_IMAGE=ubuntu:22.04
-ARG GRPC_BASE_IMAGE=${BASE_IMAGE}
+ARG BASE_IMAGE=ubuntu:24.04
 ARG INTEL_BASE_IMAGE=${BASE_IMAGE}
+ARG UBUNTU_CODENAME=noble
 
-# The requirements-core target is common to all images.  It should not be placed in requirements-core unless every single build will use it.
-FROM ${BASE_IMAGE} AS requirements-core
-
-USER root
-
-ARG GO_VERSION=1.22.6
-ARG CMAKE_VERSION=3.26.4
-ARG CMAKE_FROM_SOURCE=false
-ARG TARGETARCH
-ARG TARGETVARIANT
+FROM ${BASE_IMAGE} AS requirements
 
 ENV DEBIAN_FRONTEND=noninteractive
-ENV EXTERNAL_GRPC_BACKENDS="coqui:/build/backend/python/coqui/run.sh,transformers:/build/backend/python/transformers/run.sh,rerankers:/build/backend/python/rerankers/run.sh,bark:/build/backend/python/bark/run.sh,diffusers:/build/backend/python/diffusers/run.sh,faster-whisper:/build/backend/python/faster-whisper/run.sh,kokoro:/build/backend/python/kokoro/run.sh,vllm:/build/backend/python/vllm/run.sh,exllama2:/build/backend/python/exllama2/run.sh"
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        build-essential \
-        ccache \
-        ca-certificates \
-        curl libssl-dev \
-        git \
-        git-lfs \
-        unzip upx-ucl && \
+        ca-certificates curl wget espeak-ng libgomp1 \
+        ffmpeg libopenblas0 libopenblas-dev libopus0 sox && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
-
-# Install CMake (the version in 22.04 is too old)
-RUN <<EOT bash
-    if [ "${CMAKE_FROM_SOURCE}}" = "true" ]; then
-        curl -L -s https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}.tar.gz -o cmake.tar.gz && tar xvf cmake.tar.gz && cd cmake-${CMAKE_VERSION} && ./configure && make && make install
-    else
-        apt-get update && \
-        apt-get install -y \
-            cmake && \
-        apt-get clean && \
-        rm -rf /var/lib/apt/lists/*
-    fi
-EOT
-
-# Install Go
-RUN curl -L -s https://go.dev/dl/go${GO_VERSION}.linux-${TARGETARCH}.tar.gz | tar -C /usr/local -xz
-ENV PATH=$PATH:/root/go/bin:/usr/local/go/bin
-
-# Install grpc compilers and rice
-RUN go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.34.2 && \
-    go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@1958fcbe2ca8bd93af633f11e97d44e567e945af && \
-    go install github.com/GeertJohan/go.rice/rice@latest
-
-COPY --chmod=644 custom-ca-certs/* /usr/local/share/ca-certificates/
-RUN update-ca-certificates
-
-RUN test -n "$TARGETARCH" \
-    || (echo 'warn: missing $TARGETARCH, either set this `ARG` manually, or run using `docker buildkit`')
-
-# Use the variables in subsequent instructions
-RUN echo "Target Architecture: $TARGETARCH"
-RUN echo "Target Variant: $TARGETVARIANT"
-
-# Cuda
-ENV PATH=/usr/local/cuda/bin:${PATH}
-
-# HipBLAS requirements
-ENV PATH=/opt/rocm/bin:${PATH}
-
-# OpenBLAS requirements and stable diffusion
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-        libopenblas-dev && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/*
-
-WORKDIR /build
-
-###################################
-###################################
-
-# The requirements-extras target is for any builds with IMAGE_TYPE=extras. It should not be placed in this target unless every IMAGE_TYPE=extras build will use it
-FROM requirements-core AS requirements-extras
-
-# Install uv as a system package
-RUN curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/usr/bin sh
-ENV PATH="/root/.cargo/bin:${PATH}"
-
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-        espeak-ng \
-        espeak \
-        python3-pip \
-        python-is-python3 \
-        python3-dev llvm \
-        python3-venv && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/* && \
-    pip install --upgrade pip
-
-# Install grpcio-tools (the version in 22.04 is too old)
-RUN pip install --user grpcio-tools
-
-###################################
-###################################
 
 # The requirements-drivers target is for BUILD_TYPE specific items.  If you need to install something specific to CUDA, or specific to ROCM, it goes here.
-# This target will be built on top of requirements-core or requirements-extras as retermined by the IMAGE_TYPE build-arg
-FROM requirements-${IMAGE_TYPE} AS requirements-drivers
+FROM requirements AS requirements-drivers
 
 ARG BUILD_TYPE
 ARG CUDA_MAJOR_VERSION=12
 ARG CUDA_MINOR_VERSION=0
 ARG SKIP_DRIVERS=false
-
+ARG TARGETARCH
+ARG TARGETVARIANT
 ENV BUILD_TYPE=${BUILD_TYPE}
+ARG UBUNTU_VERSION=2404
+
+RUN mkdir -p /run/localai
+RUN echo "default" > /run/localai/capability
 
 # Vulkan requirements
 RUN <<EOT bash
@@ -122,27 +34,66 @@ RUN <<EOT bash
         apt-get update && \
         apt-get install -y  --no-install-recommends \
             software-properties-common pciutils wget gpg-agent && \
-        wget -qO - https://packages.lunarg.com/lunarg-signing-key-pub.asc | apt-key add - && \
-        wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list && \
-        apt-get update && \
-        apt-get install -y \
-            vulkan-sdk && \
+        apt-get install -y libglm-dev cmake libxcb-dri3-0 libxcb-present0 libpciaccess0 \
+            libpng-dev libxcb-keysyms1-dev libxcb-dri3-dev libx11-dev g++ gcc \
+            libwayland-dev libxrandr-dev libxcb-randr0-dev libxcb-ewmh-dev \
+            git python-is-python3 bison libx11-xcb-dev liblz4-dev libzstd-dev \
+            ocaml-core ninja-build pkg-config libxml2-dev wayland-protocols python3-jsonschema \
+            clang-format qtbase5-dev qt6-base-dev libxcb-glx0-dev sudo xz-utils mesa-vulkan-drivers
+        if [ "amd64" = "$TARGETARCH" ]; then
+            wget "https://sdk.lunarg.com/sdk/download/1.4.335.0/linux/vulkansdk-linux-x86_64-1.4.335.0.tar.xz" && \
+            tar -xf vulkansdk-linux-x86_64-1.4.335.0.tar.xz && \
+            rm vulkansdk-linux-x86_64-1.4.335.0.tar.xz && \
+            mkdir -p /opt/vulkan-sdk && \
+            mv 1.4.335.0 /opt/vulkan-sdk/ && \
+            cd /opt/vulkan-sdk/1.4.335.0 && \
+            ./vulkansdk --no-deps --maxjobs \
+                vulkan-loader \
+                vulkan-validationlayers \
+                vulkan-extensionlayer \
+                vulkan-tools \
+                shaderc && \
+            cp -rfv /opt/vulkan-sdk/1.4.335.0/x86_64/bin/* /usr/bin/ && \
+            cp -rfv /opt/vulkan-sdk/1.4.335.0/x86_64/lib/* /usr/lib/x86_64-linux-gnu/ && \
+            cp -rfv /opt/vulkan-sdk/1.4.335.0/x86_64/include/* /usr/include/ && \
+            cp -rfv /opt/vulkan-sdk/1.4.335.0/x86_64/share/* /usr/share/ && \
+            rm -rf /opt/vulkan-sdk
+        fi
+        if [ "arm64" = "$TARGETARCH" ]; then
+            mkdir vulkan && cd vulkan && \
+            curl -L -o vulkan-sdk.tar.xz https://github.com/mudler/vulkan-sdk-arm/releases/download/1.4.335.0/vulkansdk-ubuntu-24.04-arm-1.4.335.0.tar.xz && \
+            tar -xvf vulkan-sdk.tar.xz && \
+            rm vulkan-sdk.tar.xz && \
+            cd 1.4.335.0 && \
+            cp -rfv aarch64/bin/* /usr/bin/ && \
+            cp -rfv aarch64/lib/* /usr/lib/aarch64-linux-gnu/ && \
+            cp -rfv aarch64/include/* /usr/include/ && \
+            cp -rfv aarch64/share/* /usr/share/ && \
+            cd ../.. && \
+            rm -rf vulkan
+        fi
+        ldconfig && \
         apt-get clean && \
-        rm -rf /var/lib/apt/lists/*
+        rm -rf /var/lib/apt/lists/* && \
+        echo "vulkan" > /run/localai/capability
     fi
 EOT
 
 # CuBLAS requirements
 RUN <<EOT bash
-    if [ "${BUILD_TYPE}" = "cublas" ] && [ "${SKIP_DRIVERS}" = "false" ]; then
+    if ( [ "${BUILD_TYPE}" = "cublas" ] || [ "${BUILD_TYPE}" = "l4t" ] ) && [ "${SKIP_DRIVERS}" = "false" ]; then
         apt-get update && \
         apt-get install -y  --no-install-recommends \
             software-properties-common pciutils
         if [ "amd64" = "$TARGETARCH" ]; then
-            curl -O https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+            curl -O https://developer.download.nvidia.com/compute/cuda/repos/ubuntu${UBUNTU_VERSION}/x86_64/cuda-keyring_1.1-1_all.deb
         fi
         if [ "arm64" = "$TARGETARCH" ]; then
-            curl -O https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/arm64/cuda-keyring_1.1-1_all.deb
+            if [ "${CUDA_MAJOR_VERSION}" = "13" ]; then
+                curl -O https://developer.download.nvidia.com/compute/cuda/repos/ubuntu${UBUNTU_VERSION}/sbsa/cuda-keyring_1.1-1_all.deb
+            else
+                curl -O https://developer.download.nvidia.com/compute/cuda/repos/ubuntu${UBUNTU_VERSION}/arm64/cuda-keyring_1.1-1_all.deb
+            fi
         fi
         dpkg -i cuda-keyring_1.1-1_all.deb && \
         rm -f cuda-keyring_1.1-1_all.deb && \
@@ -153,9 +104,34 @@ RUN <<EOT bash
             libcurand-dev-${CUDA_MAJOR_VERSION}-${CUDA_MINOR_VERSION} \
             libcublas-dev-${CUDA_MAJOR_VERSION}-${CUDA_MINOR_VERSION} \
             libcusparse-dev-${CUDA_MAJOR_VERSION}-${CUDA_MINOR_VERSION} \
-            libcusolver-dev-${CUDA_MAJOR_VERSION}-${CUDA_MINOR_VERSION} && \
+            libcusolver-dev-${CUDA_MAJOR_VERSION}-${CUDA_MINOR_VERSION}
+        if [ "${CUDA_MAJOR_VERSION}" = "13" ] && [ "arm64" = "$TARGETARCH" ]; then
+            apt-get install -y --no-install-recommends \
+            libcufile-${CUDA_MAJOR_VERSION}-${CUDA_MINOR_VERSION} libcudnn9-cuda-${CUDA_MAJOR_VERSION} cuda-cupti-${CUDA_MAJOR_VERSION}-${CUDA_MINOR_VERSION} libnvjitlink-${CUDA_MAJOR_VERSION}-${CUDA_MINOR_VERSION}
+        fi
         apt-get clean && \
-        rm -rf /var/lib/apt/lists/*
+        rm -rf /var/lib/apt/lists/* && \
+        echo "nvidia-cuda-${CUDA_MAJOR_VERSION}" > /run/localai/capability
+    fi
+EOT
+
+RUN <<EOT bash
+    if [ "${BUILD_TYPE}" = "cublas" ] && [ "${TARGETARCH}" = "arm64" ]; then
+        echo "nvidia-l4t-cuda-${CUDA_MAJOR_VERSION}" > /run/localai/capability
+    fi
+EOT
+
+# https://github.com/NVIDIA/Isaac-GR00T/issues/343
+RUN <<EOT bash
+    if [ "${BUILD_TYPE}" = "cublas" ] && [ "${TARGETARCH}" = "arm64" ]; then
+        wget https://developer.download.nvidia.com/compute/cudss/0.6.0/local_installers/cudss-local-tegra-repo-ubuntu${UBUNTU_VERSION}-0.6.0_0.6.0-1_arm64.deb && \
+        dpkg -i cudss-local-tegra-repo-ubuntu${UBUNTU_VERSION}-0.6.0_0.6.0-1_arm64.deb && \
+        cp /var/cudss-local-tegra-repo-ubuntu${UBUNTU_VERSION}-0.6.0/cudss-*-keyring.gpg /usr/share/keyrings/ && \
+        apt-get update && apt-get -y install cudss cudss-cuda-${CUDA_MAJOR_VERSION} && \
+        wget https://developer.download.nvidia.com/compute/nvpl/25.5/local_installers/nvpl-local-repo-ubuntu${UBUNTU_VERSION}-25.5_1.0-1_arm64.deb && \
+        dpkg -i nvpl-local-repo-ubuntu${UBUNTU_VERSION}-25.5_1.0-1_arm64.deb && \
+        cp /var/nvpl-local-repo-ubuntu${UBUNTU_VERSION}-25.5/nvpl-*-keyring.gpg /usr/share/keyrings/ && \
+        apt-get update && apt-get install -y nvpl
     fi
 EOT
 
@@ -172,53 +148,56 @@ RUN if [ "${BUILD_TYPE}" = "hipblas" ] && [ "${SKIP_DRIVERS}" = "false" ]; then 
         apt-get update && \
         apt-get install -y --no-install-recommends \
             hipblas-dev \
+            hipblaslt-dev \
             rocblas-dev && \
         apt-get clean && \
         rm -rf /var/lib/apt/lists/* && \
+        echo "amd" > /run/localai/capability && \
         # I have no idea why, but the ROCM lib packages don't trigger ldconfig after they install, which results in local-ai and others not being able
         # to locate the libraries. We run ldconfig ourselves to work around this packaging deficiency
         ldconfig \
     ; fi
 
+RUN if [ "${BUILD_TYPE}" = "hipblas" ]; then \
+    ln -s /opt/rocm-**/lib/llvm/lib/libomp.so /usr/lib/libomp.so \
+    ; fi
+
+RUN expr "${BUILD_TYPE}" = intel && echo "intel" > /run/localai/capability || echo "not intel"
+
+# Cuda
+ENV PATH=/usr/local/cuda/bin:${PATH}
+
+# HipBLAS requirements
+ENV PATH=/opt/rocm/bin:${PATH}
+
 ###################################
 ###################################
 
-# Temporary workaround for Intel's repository to work correctly
-# https://community.intel.com/t5/Intel-oneAPI-Math-Kernel-Library/APT-Repository-not-working-signatures-invalid/m-p/1599436/highlight/true#M36143
-# This is a temporary workaround until Intel fixes their repository
-FROM ${INTEL_BASE_IMAGE} AS intel
-RUN wget -qO - https://repositories.intel.com/gpu/intel-graphics.key | \
-gpg --yes --dearmor --output /usr/share/keyrings/intel-graphics.gpg
-RUN echo "deb [arch=amd64 signed-by=/usr/share/keyrings/intel-graphics.gpg] https://repositories.intel.com/gpu/ubuntu jammy/lts/2350 unified" > /etc/apt/sources.list.d/intel-graphics.list
+# The requirements-core target is common to all images.  It should not be placed in requirements-core unless every single build will use it.
+FROM requirements-drivers AS build-requirements
 
-###################################
-###################################
-
-# The grpc target does one thing, it builds and installs GRPC.  This is in it's own layer so that it can be effectively cached by CI.
-# You probably don't need to change anything here, and if you do, make sure that CI is adjusted so that the cache continues to work.
-FROM ${GRPC_BASE_IMAGE} AS grpc
-
-# This is a bit of a hack, but it's required in order to be able to effectively cache this layer in CI
-ARG GRPC_MAKEFLAGS="-j4 -Otarget"
-ARG GRPC_VERSION=v1.65.0
+ARG GO_VERSION=1.26.0
+ARG CMAKE_VERSION=3.31.10
 ARG CMAKE_FROM_SOURCE=false
-ARG CMAKE_VERSION=3.26.4
-
-ENV MAKEFLAGS=${GRPC_MAKEFLAGS}
-
-WORKDIR /build
+ARG TARGETARCH
+ARG TARGETVARIANT
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        ca-certificates \
-        build-essential curl libssl-dev \
-        git && \
+        build-essential \
+        ccache \
+        ca-certificates espeak-ng \
+        curl libssl-dev \
+        git \
+        git-lfs \
+        libopus-dev pkg-config \
+        unzip upx-ucl python3 python-is-python3 && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
 # Install CMake (the version in 22.04 is too old)
 RUN <<EOT bash
-    if [ "${CMAKE_FROM_SOURCE}}" = "true" ]; then
+    if [ "${CMAKE_FROM_SOURCE}" = "true" ]; then
         curl -L -s https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}.tar.gz -o cmake.tar.gz && tar xvf cmake.tar.gz && cd cmake-${CMAKE_VERSION} && ./configure && make && make install
     else
         apt-get update && \
@@ -229,30 +208,60 @@ RUN <<EOT bash
     fi
 EOT
 
-# We install GRPC to a different prefix here so that we can copy in only the build artifacts later
-# saves several hundred MB on the final docker image size vs copying in the entire GRPC source tree
-# and running make install in the target container
-RUN git clone --recurse-submodules --jobs 4 -b ${GRPC_VERSION} --depth 1 --shallow-submodules https://github.com/grpc/grpc && \
-    mkdir -p /build/grpc/cmake/build && \
-    cd /build/grpc/cmake/build && \
-    sed -i "216i\  TESTONLY" "../../third_party/abseil-cpp/absl/container/CMakeLists.txt" && \
-    cmake -DgRPC_INSTALL=ON -DgRPC_BUILD_TESTS=OFF -DCMAKE_INSTALL_PREFIX:PATH=/opt/grpc ../.. && \
-    make && \
-    make install && \
-    rm -rf /build
+# Install Go
+RUN curl -L -s https://go.dev/dl/go${GO_VERSION}.linux-${TARGETARCH}.tar.gz | tar -C /usr/local -xz
+ENV PATH=$PATH:/root/go/bin:/usr/local/go/bin
+
+# Install grpc compilers
+RUN go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.34.2 && \
+    go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@1958fcbe2ca8bd93af633f11e97d44e567e945af
+
+COPY --chmod=644 custom-ca-certs/* /usr/local/share/ca-certificates/
+RUN update-ca-certificates
+
+RUN test -n "$TARGETARCH" \
+    || (echo 'warn: missing $TARGETARCH, either set this `ARG` manually, or run using `docker buildkit`')
+
+# Use the variables in subsequent instructions
+RUN echo "Target Architecture: $TARGETARCH"
+RUN echo "Target Variant: $TARGETVARIANT"
+
+
+
+
+WORKDIR /build
+
+
+###################################
+###################################
+
+# Temporary workaround for Intel's repository to work correctly
+# https://community.intel.com/t5/Intel-oneAPI-Math-Kernel-Library/APT-Repository-not-working-signatures-invalid/m-p/1599436/highlight/true#M36143
+# This is a temporary workaround until Intel fixes their repository
+FROM ${INTEL_BASE_IMAGE} AS intel
+ARG UBUNTU_CODENAME=noble
+RUN wget -qO - https://repositories.intel.com/gpu/intel-graphics.key | \
+gpg --yes --dearmor --output /usr/share/keyrings/intel-graphics.gpg
+RUN echo "deb [arch=amd64 signed-by=/usr/share/keyrings/intel-graphics.gpg] https://repositories.intel.com/gpu/ubuntu ${UBUNTU_CODENAME}/lts/2350 unified" > /etc/apt/sources.list.d/intel-graphics.list
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        intel-oneapi-runtime-libs && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
 
 ###################################
 ###################################
 
 # The builder-base target has the arguments, variables, and copies shared between full builder images and the uncompiled devcontainer
 
-FROM requirements-drivers AS builder-base
+FROM build-requirements AS builder-base
 
-ARG GO_TAGS="tts p2p"
+ARG GO_TAGS="auth"
 ARG GRPC_BACKENDS
 ARG MAKEFLAGS
 ARG LD_FLAGS="-s -w"
-
+ARG TARGETARCH
+ARG TARGETVARIANT
 ENV GRPC_BACKENDS=${GRPC_BACKENDS}
 ENV GO_TAGS=${GO_TAGS}
 ENV MAKEFLAGS=${MAKEFLAGS}
@@ -266,9 +275,7 @@ RUN echo "GO_TAGS: $GO_TAGS" && echo "TARGETARCH: $TARGETARCH"
 WORKDIR /build
 
 
-# We need protoc installed, and the version in 22.04 is too old.  We will create one as part installing the GRPC build below
-# but that will also being in a newer version of absl which stablediffusion cannot compile with.  This version of protoc is only
-# here so that we can generate the grpc code for the stablediffusion build
+# We need protoc installed, and the version in 22.04 is too old.
 RUN <<EOT bash
     if [ "amd64" = "$TARGETARCH" ]; then
         curl -L -s https://github.com/protocolbuffers/protobuf/releases/download/v27.1/protoc-27.1-linux-x86_64.zip -o protoc.zip && \
@@ -285,34 +292,52 @@ EOT
 ###################################
 ###################################
 
+# Build React UI
+FROM node:25-slim AS react-ui-builder
+WORKDIR /app
+COPY core/http/react-ui/package*.json ./
+RUN npm install
+COPY core/http/react-ui/ ./
+RUN npm run build
+
+###################################
+###################################
+
+# Compile backends first in a separate stage
+FROM builder-base AS builder-backends
+ARG TARGETARCH
+ARG TARGETVARIANT
+
+WORKDIR /build
+
+COPY ./Makefile .
+COPY ./backend ./backend
+COPY ./go.mod .
+COPY ./go.sum .
+COPY ./.git ./.git
+
+# Some of the Go backends use libs from the main src, we could further optimize the caching by building the CPP backends before here
+COPY ./pkg/grpc ./pkg/grpc
+COPY ./pkg/utils ./pkg/utils
+
+RUN ls -l ./
+RUN make protogen-go
+
 # The builder target compiles LocalAI. This target is not the target that will be uploaded to the registry.
 # Adjustments to the build process should likely be made here.
-FROM builder-base AS builder
+FROM builder-backends AS builder
 
-# Install the pre-built GRPC
-COPY --from=grpc /opt/grpc /usr/local
-
-# Rebuild with defaults backends
 WORKDIR /build
 
 COPY . .
-COPY .git .
 
-RUN make prepare
+# Copy pre-built React UI
+COPY --from=react-ui-builder /app/dist ./core/http/react-ui/dist
 
 ## Build the binary
 ## If we're on arm64 AND using cublas/hipblas, skip some of the llama-compat backends to save space
 ## Otherwise just run the normal build
-RUN if [ "${TARGETARCH}" = "arm64" ] || [ "${BUILD_TYPE}" = "hipblas" ]; then \
-        SKIP_GRPC_BACKEND="backend-assets/grpc/llama-cpp-avx512 backend-assets/grpc/llama-cpp-avx backend-assets/grpc/llama-cpp-avx2" make build; \
-    else \
-        make build; \
-    fi
-
-RUN if [ ! -d "/build/sources/go-piper/piper-phonemize/pi/lib/" ]; then \
-        mkdir -p /build/sources/go-piper/piper-phonemize/pi/lib/ \
-        touch /build/sources/go-piper/piper-phonemize/pi/lib/keep \
-    ; fi
+RUN make build
 
 ###################################
 ###################################
@@ -322,24 +347,11 @@ RUN if [ ! -d "/build/sources/go-piper/piper-phonemize/pi/lib/" ]; then \
 
 FROM builder-base AS devcontainer
 
-ARG FFMPEG
-
-COPY --from=grpc /opt/grpc /usr/local
-
 COPY .devcontainer-scripts /.devcontainer-scripts
-
-# Add FFmpeg
-RUN if [ "${FFMPEG}" = "true" ]; then \
-        apt-get update && \
-        apt-get install -y --no-install-recommends \
-            ffmpeg && \
-        apt-get clean && \
-        rm -rf /var/lib/apt/lists/* \
-    ; fi
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        ssh less wget
+        ssh less
 # For the devcontainer, leave apt functional in case additional devtools are needed at runtime.
 
 RUN go install github.com/go-delve/delve/cmd/dlv@latest
@@ -353,98 +365,30 @@ RUN go install github.com/mikefarah/yq/v4@latest
 # If you cannot find a more suitable place for an addition, this layer is a suitable place for it.
 FROM requirements-drivers
 
-ARG FFMPEG
-ARG BUILD_TYPE
-ARG TARGETARCH
-ARG IMAGE_TYPE=extras
-ARG EXTRA_BACKENDS
-ARG MAKEFLAGS
-
-ENV BUILD_TYPE=${BUILD_TYPE}
-ENV REBUILD=false
 ENV HEALTHCHECK_ENDPOINT=http://localhost:8080/readyz
-ENV MAKEFLAGS=${MAKEFLAGS}
 
 ARG CUDA_MAJOR_VERSION=12
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
 ENV NVIDIA_REQUIRE_CUDA="cuda>=${CUDA_MAJOR_VERSION}.0"
 ENV NVIDIA_VISIBLE_DEVICES=all
 
-# Add FFmpeg
-RUN if [ "${FFMPEG}" = "true" ]; then \
-        apt-get update && \
-        apt-get install -y --no-install-recommends \
-            ffmpeg && \
-        apt-get clean && \
-        rm -rf /var/lib/apt/lists/* \
-    ; fi
+WORKDIR /
 
-WORKDIR /build
-
-# we start fresh & re-copy all assets because `make build` does not clean up nicely after itself
-# so when `entrypoint.sh` runs `make build` again (which it does by default), the build would fail
-# see https://github.com/go-skynet/LocalAI/pull/658#discussion_r1241971626 and
-# https://github.com/go-skynet/LocalAI/pull/434
-COPY . .
-
-COPY --from=builder /build/sources ./sources/
-COPY --from=grpc /opt/grpc /usr/local
-
-RUN make prepare-sources
+COPY ./entrypoint.sh .
 
 # Copy the binary
 COPY --from=builder /build/local-ai ./
-
-# Copy shared libraries for piper
-COPY --from=builder /build/sources/go-piper/piper-phonemize/pi/lib/* /usr/lib/
-
-# Change the shell to bash so we can use [[ tests below
-SHELL ["/bin/bash", "-c"]
-# We try to strike a balance between individual layer size (as that affects total push time) and total image size
-# Splitting the backends into more groups with fewer items results in a larger image, but a smaller size for the largest layer
-# Splitting the backends into fewer groups with more items results in a smaller image, but a larger size for the largest layer
-
-RUN if [[ ( "${IMAGE_TYPE}" == "extras ")]]; then \
-        apt-get -qq -y install espeak-ng \
-    ; fi
-
-RUN if [[ ( "${EXTRA_BACKENDS}" =~ "coqui" || -z "${EXTRA_BACKENDS}" ) && "$IMAGE_TYPE" == "extras" ]]; then \
-        make -C backend/python/coqui \
-    ; fi && \
-    if [[ ( "${EXTRA_BACKENDS}" =~ "faster-whisper" || -z "${EXTRA_BACKENDS}" ) && "$IMAGE_TYPE" == "extras" ]]; then \
-        make -C backend/python/faster-whisper \
-    ; fi && \
-    if [[ ( "${EXTRA_BACKENDS}" =~ "diffusers" || -z "${EXTRA_BACKENDS}" ) && "$IMAGE_TYPE" == "extras" ]]; then \
-        make -C backend/python/diffusers \
-    ; fi
-
-RUN if [[ ( "${EXTRA_BACKENDS}" =~ "kokoro" || -z "${EXTRA_BACKENDS}" ) && "$IMAGE_TYPE" == "extras" ]]; then \
-        make -C backend/python/kokoro \
-    ; fi && \
-    if [[ ( "${EXTRA_BACKENDS}" =~ "exllama2" || -z "${EXTRA_BACKENDS}" ) && "$IMAGE_TYPE" == "extras" ]]; then \
-        make -C backend/python/exllama2 \
-    ; fi && \
-    if [[ ( "${EXTRA_BACKENDS}" =~ "transformers" || -z "${EXTRA_BACKENDS}" ) && "$IMAGE_TYPE" == "extras" ]]; then \
-        make -C backend/python/transformers \
-    ; fi
-
-RUN if [[ ( "${EXTRA_BACKENDS}" =~ "vllm" || -z "${EXTRA_BACKENDS}" ) && "$IMAGE_TYPE" == "extras" ]]; then \
-        make -C backend/python/vllm \
-    ; fi && \
-    if [[ ( "${EXTRA_BACKENDS}" =~ "bark" || -z "${EXTRA_BACKENDS}" ) && "$IMAGE_TYPE" == "extras" ]]; then \
-        make -C backend/python/bark \
-    ; fi && \
-    if [[ ( "${EXTRA_BACKENDS}" =~ "rerankers" || -z "${EXTRA_BACKENDS}" ) && "$IMAGE_TYPE" == "extras" ]]; then \
-        make -C backend/python/rerankers \
-    ; fi
+# Copy the opus shim if it was built
+RUN --mount=from=builder,src=/build/,dst=/mnt/build \
+    if [ -f /mnt/build/libopusshim.so ]; then cp /mnt/build/libopusshim.so ./; fi
 
 # Make sure the models directory exists
-RUN mkdir -p /build/models
+RUN mkdir -p /models /backends /data
 
 # Define the health check command
 HEALTHCHECK --interval=1m --timeout=10m --retries=10 \
   CMD curl -f ${HEALTHCHECK_ENDPOINT} || exit 1
 
-VOLUME /build/models
+VOLUME /models /backends /configuration /data
 EXPOSE 8080
-ENTRYPOINT [ "/build/entrypoint.sh" ]
+ENTRYPOINT [ "/entrypoint.sh" ]

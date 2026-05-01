@@ -1,6 +1,3 @@
-//go:build p2p
-// +build p2p
-
 package p2p
 
 import (
@@ -16,6 +13,7 @@ import (
 
 	"github.com/ipfs/go-log"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/mudler/LocalAI/core/schema"
 	"github.com/mudler/LocalAI/pkg/utils"
 	"github.com/mudler/edgevpn/pkg/config"
 	"github.com/mudler/edgevpn/pkg/node"
@@ -23,9 +21,9 @@ import (
 	"github.com/mudler/edgevpn/pkg/services"
 	"github.com/mudler/edgevpn/pkg/types"
 	eutils "github.com/mudler/edgevpn/pkg/utils"
+	zlog "github.com/mudler/xlog"
 	"github.com/multiformats/go-multiaddr"
 	"github.com/phayes/freeport"
-	zlog "github.com/rs/zerolog/log"
 
 	"github.com/mudler/edgevpn/pkg/logger"
 )
@@ -34,7 +32,7 @@ func generateNewConnectionData(DHTInterval, OTPInterval int) *node.YAMLConnectio
 	maxMessSize := 20 << 20 // 20MB
 	keyLength := 43
 	if DHTInterval == 0 {
-		DHTInterval = 360
+		DHTInterval = 30
 	}
 	if OTPInterval == 0 {
 		OTPInterval = 9000
@@ -65,10 +63,6 @@ func GenerateToken(DHTInterval, OTPInterval int) string {
 	return generateNewConnectionData(DHTInterval, OTPInterval).Base64()
 }
 
-func IsP2PEnabled() bool {
-	return true
-}
-
 func nodeID(s string) string {
 	hostname, _ := os.Hostname()
 	return fmt.Sprintf("%s-%s", hostname, s)
@@ -82,7 +76,7 @@ func nodeAnnounce(ctx context.Context, node *node.Node) {
 		ctx,
 		10*time.Second,
 		func() {
-			updatedMap := map[string]interface{}{}
+			updatedMap := map[string]any{}
 			updatedMap[node.Host().ID().String()] = &types.User{
 				PeerID:    node.Host().ID().String(),
 				Timestamp: time.Now().String(),
@@ -100,7 +94,7 @@ func proxyP2PConnection(ctx context.Context, node *node.Node, serviceID string, 
 	existingValue.Unmarshal(service)
 	// If mismatch, update the blockchain
 	if !found {
-		zlog.Error().Msg("Service not found on blockchain")
+		zlog.Error("Service not found on blockchain")
 		conn.Close()
 		//	ll.Debugf("service '%s' not found on blockchain", serviceID)
 		return
@@ -109,7 +103,7 @@ func proxyP2PConnection(ctx context.Context, node *node.Node, serviceID string, 
 	// Decode the Peer
 	d, err := peer.Decode(service.PeerID)
 	if err != nil {
-		zlog.Error().Msg("cannot decode peer")
+		zlog.Error("cannot decode peer")
 
 		conn.Close()
 		//	ll.Debugf("could not decode peer '%s'", service.PeerID)
@@ -119,14 +113,14 @@ func proxyP2PConnection(ctx context.Context, node *node.Node, serviceID string, 
 	// Open a stream
 	stream, err := node.Host().NewStream(ctx, d, protocol.ServiceProtocol.ID())
 	if err != nil {
-		zlog.Error().Err(err).Msg("cannot open stream peer")
+		zlog.Error("cannot open stream peer", "error", err)
 
 		conn.Close()
 		//	ll.Debugf("could not open stream '%s'", err.Error())
 		return
 	}
 	//	ll.Debugf("(service %s) Redirecting", serviceID, l.Addr().String())
-	zlog.Info().Msgf("Redirecting %s to %s", conn.LocalAddr().String(), stream.Conn().RemoteMultiaddr().String())
+	zlog.Info("Redirecting", "from", conn.LocalAddr().String(), "to", stream.Conn().RemoteMultiaddr().String())
 	closer := make(chan struct{}, 2)
 	go copyStream(closer, stream, conn)
 	go copyStream(closer, conn, stream)
@@ -137,11 +131,11 @@ func proxyP2PConnection(ctx context.Context, node *node.Node, serviceID string, 
 }
 
 func allocateLocalService(ctx context.Context, node *node.Node, listenAddr, service string) error {
-	zlog.Info().Msgf("Allocating service '%s' on: %s", service, listenAddr)
+	zlog.Info("Allocating service", "service", service, "address", listenAddr)
 	// Open local port for listening
 	l, err := net.Listen("tcp", listenAddr)
 	if err != nil {
-		zlog.Error().Err(err).Msg("Error listening")
+		zlog.Error("Error listening", "error", err)
 		return err
 	}
 	go func() {
@@ -157,7 +151,7 @@ func allocateLocalService(ctx context.Context, node *node.Node, listenAddr, serv
 		case <-ctx.Done():
 			return errors.New("context canceled")
 		default:
-			zlog.Debug().Msg("New for connection")
+			zlog.Debug("New for connection")
 			// Listen for an incoming connection.
 			conn, err := l.Accept()
 			if err != nil {
@@ -176,7 +170,7 @@ func allocateLocalService(ctx context.Context, node *node.Node, listenAddr, serv
 
 // This is the main of the server (which keeps the env variable updated)
 // This starts a goroutine that keeps LLAMACPP_GRPC_SERVERS updated with the discovered services
-func ServiceDiscoverer(ctx context.Context, n *node.Node, token, servicesID string, discoveryFunc func(serviceID string, node NodeData), allocate bool) error {
+func ServiceDiscoverer(ctx context.Context, n *node.Node, token, servicesID string, discoveryFunc func(serviceID string, node schema.NodeData), allocate bool) error {
 	if servicesID == "" {
 		servicesID = defaultServicesID
 	}
@@ -193,7 +187,7 @@ func ServiceDiscoverer(ctx context.Context, n *node.Node, token, servicesID stri
 		for {
 			select {
 			case <-ctx.Done():
-				zlog.Error().Msg("Discoverer stopped")
+				zlog.Error("Discoverer stopped")
 				return
 			case tunnel := <-tunnels:
 				AddNode(servicesID, tunnel)
@@ -207,8 +201,8 @@ func ServiceDiscoverer(ctx context.Context, n *node.Node, token, servicesID stri
 	return nil
 }
 
-func discoveryTunnels(ctx context.Context, n *node.Node, token, servicesID string, allocate bool) (chan NodeData, error) {
-	tunnels := make(chan NodeData)
+func discoveryTunnels(ctx context.Context, n *node.Node, token, servicesID string, allocate bool) (chan schema.NodeData, error) {
+	tunnels := make(chan schema.NodeData)
 
 	ledger, err := n.Ledger()
 	if err != nil {
@@ -221,12 +215,12 @@ func discoveryTunnels(ctx context.Context, n *node.Node, token, servicesID strin
 	// - starts a service if not started, if the worker is Online
 	// - checks that workers are Online, if not cancel the context of allocateLocalService
 	// - discoveryTunnels should return all the nodes and addresses associated with it
-	// - the caller should take now care of the fact that we are always returning fresh informations
+	// - the caller should take now care of the fact that we are always returning fresh information
 	go func() {
 		for {
 			select {
 			case <-ctx.Done():
-				zlog.Error().Msg("Discoverer stopped")
+				zlog.Error("Discoverer stopped")
 				return
 			default:
 				time.Sleep(5 * time.Second)
@@ -236,14 +230,14 @@ func discoveryTunnels(ctx context.Context, n *node.Node, token, servicesID strin
 				if logLevel == logLevelDebug {
 					// We want to surface this debugging data only if p2p logging is set to debug
 					// (and not generally the whole application, as this can be really noisy)
-					zlog.Debug().Any("data", ledger.LastBlock().Storage).Msg("Ledger data")
+					zlog.Debug("Ledger data", "data", ledger.LastBlock().Storage)
 				}
 
 				for k, v := range data {
 					// New worker found in the ledger data as k (worker id)
-					nd := &NodeData{}
+					nd := &schema.NodeData{}
 					if err := v.Unmarshal(nd); err != nil {
-						zlog.Error().Msg("cannot unmarshal node data")
+						zlog.Error("cannot unmarshal node data")
 						continue
 					}
 					ensureService(ctx, n, nd, k, allocate)
@@ -261,14 +255,14 @@ func discoveryTunnels(ctx context.Context, n *node.Node, token, servicesID strin
 }
 
 type nodeServiceData struct {
-	NodeData   NodeData
+	NodeData   schema.NodeData
 	CancelFunc context.CancelFunc
 }
 
 var service = map[string]nodeServiceData{}
 var muservice sync.Mutex
 
-func ensureService(ctx context.Context, n *node.Node, nd *NodeData, sserv string, allocate bool) {
+func ensureService(ctx context.Context, n *node.Node, nd *schema.NodeData, sserv string, allocate bool) {
 	muservice.Lock()
 	defer muservice.Unlock()
 	nd.ServiceID = sserv
@@ -284,14 +278,15 @@ func ensureService(ctx context.Context, n *node.Node, nd *NodeData, sserv string
 			// Start the service
 			port, err := freeport.GetFreePort()
 			if err != nil {
-				zlog.Error().Err(err).Msgf("Could not allocate a free port for %s", nd.ID)
+				zlog.Error("Could not allocate a free port", "error", err, "node", nd.ID)
+				cancel()
 				return
 			}
 
 			tunnelAddress := fmt.Sprintf("127.0.0.1:%d", port)
 			nd.TunnelAddress = tunnelAddress
 			go allocateLocalService(newCtxm, n, tunnelAddress, sserv)
-			zlog.Debug().Msgf("Starting service %s on %s", sserv, tunnelAddress)
+			zlog.Debug("Starting service", "service", sserv, "address", tunnelAddress)
 		}
 		service[nd.Name] = nodeServiceData{
 			NodeData:   *nd,
@@ -303,7 +298,7 @@ func ensureService(ctx context.Context, n *node.Node, nd *NodeData, sserv string
 		if !nd.IsOnline() && !ndService.NodeData.IsOnline() {
 			ndService.CancelFunc()
 			delete(service, nd.Name)
-			zlog.Info().Msgf("Node %s is offline, deleting", nd.ID)
+			zlog.Info("Node is offline, deleting", "node", nd.ID)
 		} else if nd.IsOnline() {
 			// update last seen inside service
 			nd.TunnelAddress = ndService.NodeData.TunnelAddress
@@ -351,8 +346,8 @@ func ExposeService(ctx context.Context, host, port, token, servicesID string) (*
 		ctx,
 		20*time.Second,
 		func() {
-			updatedMap := map[string]interface{}{}
-			updatedMap[name] = &NodeData{
+			updatedMap := map[string]any{}
+			updatedMap[name] = &schema.NodeData{
 				Name:     name,
 				LastSeen: time.Now(),
 				ID:       nodeID(name),
@@ -384,7 +379,7 @@ func newNodeOpts(token string) ([]node.Option, error) {
 
 	// TODO: move this up, expose more config options when creating a node
 	noDHT := os.Getenv("LOCALAI_P2P_DISABLE_DHT") == "true"
-	noLimits := os.Getenv("LOCALAI_P2P_ENABLE_LIMITS") == "true"
+	noLimits := os.Getenv("LOCALAI_P2P_ENABLE_LIMITS") != "true"
 
 	var listenMaddrs []string
 	var bootstrapPeers []string

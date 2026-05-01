@@ -5,284 +5,62 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
-	"slices"
 	"strings"
 	"time"
 
-	"github.com/klauspost/cpuid/v2"
 	grpc "github.com/mudler/LocalAI/pkg/grpc"
-	"github.com/mudler/LocalAI/pkg/library"
-	"github.com/mudler/LocalAI/pkg/utils"
-	"github.com/mudler/LocalAI/pkg/xsysinfo"
+	"github.com/mudler/xlog"
 	"github.com/phayes/freeport"
-	"github.com/rs/zerolog/log"
-
-	"github.com/elliotchance/orderedmap/v2"
 )
 
-var Aliases map[string]string = map[string]string{
+const (
+	LLamaCPP   = "llama-cpp"
+	IKLLamaCPP = "ik-llama-cpp"
+)
+
+var Aliases = map[string]string{
 	"go-llama":               LLamaCPP,
 	"llama":                  LLamaCPP,
+	"ik_llama":               IKLLamaCPP,
+	"ik-llama":               IKLLamaCPP,
 	"embedded-store":         LocalStoreBackend,
 	"huggingface-embeddings": TransformersBackend,
-	"langchain-huggingface":  LCHuggingFaceBackend,
 	"transformers-musicgen":  TransformersBackend,
 	"sentencetransformers":   TransformersBackend,
 	"mamba":                  TransformersBackend,
 	"stablediffusion":        StableDiffusionGGMLBackend,
 }
 
-var TypeAlias map[string]string = map[string]string{
+var TypeAlias = map[string]string{
 	"sentencetransformers":   "SentenceTransformer",
 	"huggingface-embeddings": "SentenceTransformer",
 	"mamba":                  "Mamba",
 	"transformers-musicgen":  "MusicgenForConditionalGeneration",
 }
 
-var AutoDetect = os.Getenv("DISABLE_AUTODETECT") != "true"
-
 const (
-	LLamaCPP = "llama-cpp"
-
-	LLamaCPPAVX2     = "llama-cpp-avx2"
-	LLamaCPPAVX512   = "llama-cpp-avx512"
-	LLamaCPPAVX      = "llama-cpp-avx"
-	LLamaCPPFallback = "llama-cpp-fallback"
-	LLamaCPPCUDA     = "llama-cpp-cuda"
-	LLamaCPPHipblas  = "llama-cpp-hipblas"
-	LLamaCPPSycl16   = "llama-cpp-sycl_16"
-	LLamaCPPSycl32   = "llama-cpp-sycl_32"
-
-	LLamaCPPGRPC = "llama-cpp-grpc"
-
 	WhisperBackend             = "whisper"
 	StableDiffusionGGMLBackend = "stablediffusion-ggml"
-	PiperBackend               = "piper"
-	LCHuggingFaceBackend       = "huggingface"
 
 	TransformersBackend = "transformers"
 	LocalStoreBackend   = "local-store"
 )
 
-var llamaCPPVariants = []string{
-	LLamaCPPAVX2,
-	LLamaCPPAVX512,
-	LLamaCPPAVX,
-	LLamaCPPFallback,
-	LLamaCPPCUDA,
-	LLamaCPPHipblas,
-	LLamaCPPSycl16,
-	LLamaCPPSycl32,
-	LLamaCPPGRPC,
-}
-
-func backendPath(assetDir, backend string) string {
-	return filepath.Join(assetDir, "backend-assets", "grpc", backend)
-}
-
-// backendsInAssetDir returns the list of backends in the asset directory
-// that should be loaded
-func backendsInAssetDir(assetDir string) (map[string][]string, error) {
-	// Exclude backends from automatic loading
-	excludeBackends := []string{LocalStoreBackend}
-	entry, err := os.ReadDir(backendPath(assetDir, ""))
-	if err != nil {
-		return nil, err
-	}
-	backends := make(map[string][]string)
-ENTRY:
-	for _, e := range entry {
-		for _, exclude := range excludeBackends {
-			if e.Name() == exclude {
-				continue ENTRY
-			}
-		}
-		if e.IsDir() {
-			continue
-		}
-		if strings.HasSuffix(e.Name(), ".log") {
-			continue
-		}
-
-		// Skip the llama.cpp variants if we are autoDetecting
-		// But we always load the fallback variant if it exists
-		if strings.Contains(e.Name(), LLamaCPP) && !strings.Contains(e.Name(), LLamaCPPFallback) && AutoDetect {
-			continue
-		}
-
-		backends[e.Name()] = []string{}
-	}
-
-	// if we are autoDetecting, we want to show the llama.cpp variants as a single backend
-	if AutoDetect {
-		// if we find the llama.cpp variants, show them of as a single backend (llama-cpp) as later we are going to pick that up
-		// when starting the service
-		foundVariants := map[string]bool{}
-		if _, ok := backends[LLamaCPP]; !ok {
-			for _, e := range entry {
-				for _, v := range llamaCPPVariants {
-					if strings.Contains(e.Name(), v) && !foundVariants[v] {
-						backends[LLamaCPP] = append(backends[LLamaCPP], v)
-						foundVariants[v] = true
-					}
-				}
-			}
-		}
-	}
-
-	return backends, nil
-}
-
-func orderBackends(backends map[string][]string) ([]string, error) {
-	// order backends from the asset directory.
-	// as we scan for backends, we want to keep some order which backends are tried of.
-	// for example, llama.cpp should be tried first, and we want to keep the huggingface backend at the last.
-
-	// sets a priority list - first has more priority
-	priorityList := []string{
-		// First llama.cpp(variants)
-		// We keep the fallback to prevent that if the llama.cpp variants
-		// that depends on shared libs if breaks have still a safety net.
-		LLamaCPP, LLamaCPPFallback,
-	}
-
-	toTheEnd := []string{
-		// last has to be huggingface
-		LCHuggingFaceBackend,
-	}
-
-	// create an ordered map
-	orderedBackends := orderedmap.NewOrderedMap[string, any]()
-	// add priorityList first
-	for _, p := range priorityList {
-		if _, ok := backends[p]; ok {
-			orderedBackends.Set(p, backends[p])
-		}
-	}
-
-	for k, v := range backends {
-		if !slices.Contains(toTheEnd, k) {
-			if _, ok := orderedBackends.Get(k); !ok {
-				orderedBackends.Set(k, v)
-			}
-		}
-	}
-
-	for _, t := range toTheEnd {
-		if _, ok := backends[t]; ok {
-			orderedBackends.Set(t, backends[t])
-		}
-	}
-
-	return orderedBackends.Keys(), nil
-}
-
-// selectGRPCProcessByHostCapabilities selects the GRPC process to start based on system capabilities
-// Note: this is now relevant only for llama.cpp
-func selectGRPCProcessByHostCapabilities(backend, assetDir string, f16 bool) string {
-
-	// Select backend now just for llama.cpp
-	if backend != LLamaCPP {
-		return ""
-	}
-
-	// Note: This environment variable is read by the LocalAI's llama.cpp grpc-server
-	if os.Getenv("LLAMACPP_GRPC_SERVERS") != "" {
-		log.Info().Msgf("[%s] attempting to load with GRPC variant", LLamaCPPGRPC)
-		return backendPath(assetDir, LLamaCPPGRPC)
-	}
-
-	// Check for GPU-binaries that are shipped with single binary releases
-	gpuBinaries := map[string]string{
-		"nvidia": LLamaCPPCUDA,
-		"amd":    LLamaCPPHipblas,
-		"intel":  LLamaCPPSycl16,
-	}
-
-	if !f16 {
-		gpuBinaries["intel"] = LLamaCPPSycl32
-	}
-
-	for vendor, binary := range gpuBinaries {
-		if xsysinfo.HasGPU(vendor) {
-			p := backendPath(assetDir, binary)
-			if _, err := os.Stat(p); err == nil {
-				log.Info().Msgf("[%s] attempting to load with %s variant (vendor: %s)", backend, binary, vendor)
-				return p
-			}
-		}
-	}
-
-	// No GPU found or no specific binaries found, try to load the CPU variant(s)
-
-	// Select a binary based on availability/capability
-	selectedProcess := ""
-
-	// Check if we have a native build (llama-cpp) and use that
-	if _, err := os.Stat(backendPath(assetDir, LLamaCPPFallback)); err == nil {
-		log.Debug().Msgf("[%s] %s variant available", LLamaCPPFallback, backend)
-		selectedProcess = backendPath(assetDir, LLamaCPPFallback)
-	}
-
-	// Check if we have a native build (llama-cpp) and use that instead
-	// As a reminder, we do ultimately attempt again with the fallback variant
-	// If things fail with what we select here
-	if _, err := os.Stat(backendPath(assetDir, LLamaCPP)); err == nil {
-		log.Debug().Msgf("[%s] attempting to load with native variant", backend)
-		selectedProcess = backendPath(assetDir, LLamaCPP)
-	}
-
-	// IF we find any optimized binary, we use that
-	if xsysinfo.HasCPUCaps(cpuid.AVX512F) {
-		p := backendPath(assetDir, LLamaCPPAVX512)
-		if _, err := os.Stat(p); err == nil {
-			log.Info().Msgf("[%s] attempting to load with AVX512 variant", backend)
-			selectedProcess = p
-		}
-	} else if xsysinfo.HasCPUCaps(cpuid.AVX2) {
-		p := backendPath(assetDir, LLamaCPPAVX2)
-		if _, err := os.Stat(p); err == nil {
-			log.Info().Msgf("[%s] attempting to load with AVX2 variant", backend)
-			selectedProcess = p
-		}
-	} else if xsysinfo.HasCPUCaps(cpuid.AVX) {
-		p := backendPath(assetDir, LLamaCPPAVX)
-		if _, err := os.Stat(p); err == nil {
-			log.Info().Msgf("[%s] attempting to load with AVX variant", backend)
-			selectedProcess = p
-		}
-	}
-
-	// Safety measure: check if the binary exists otherwise return empty string
-	if _, err := os.Stat(selectedProcess); err == nil {
-		return selectedProcess
-	}
-
-	return ""
-}
-
-func attemptLoadingOnFailure(backend string, ml *ModelLoader, o *Options, err error) (*Model, error) {
-	// XXX: This is too backend specific(llama-cpp), remove this bit or generalize further
-	// We failed somehow starting the binary. For instance, could be that we are missing
-	// some libraries if running in binary-only mode.
-	// In this case, we attempt to load the model with the fallback variant.
-
-	// If not llama-cpp backend, return the error immediately
-	if backend != LLamaCPP {
-		return nil, err
-	}
-
-	log.Error().Msgf("[%s] Failed loading model, trying with fallback '%s', error: %s", backend, LLamaCPPFallback, err.Error())
-	return ml.LoadModel(o.modelID, o.model, ml.grpcModel(LLamaCPPFallback, false, o))
-}
-
 // starts the grpcModelProcess for the backend, and returns a grpc client
 // It also loads the model
-func (ml *ModelLoader) grpcModel(backend string, autodetect bool, o *Options) func(string, string, string) (*Model, error) {
+func (ml *ModelLoader) grpcModel(backend string, o *Options) func(string, string, string) (*Model, error) {
 	return func(modelID, modelName, modelFile string) (*Model, error) {
 
-		log.Debug().Msgf("Loading Model %s with gRPC (file: %s) (backend: %s): %+v", modelID, modelFile, backend, *o)
+		xlog.Debug("Loading Model with gRPC", "modelID", modelID, "file", modelFile, "backend", backend, "options", *o)
+
+		// Distributed mode: delegate to the model router if set
+		ml.mu.Lock()
+		router := ml.modelRouter
+		ml.mu.Unlock()
+		if router != nil {
+			xlog.Info("Routing model to remote node via ModelRouter", "modelID", modelID, "backend", backend)
+			return router(o.context, backend, modelID, modelName, modelFile, o.gRPCOptions, o.parallelRequests)
+		}
 
 		var client *Model
 
@@ -299,17 +77,17 @@ func (ml *ModelLoader) grpcModel(backend string, autodetect bool, o *Options) fu
 			if os.Getenv(env) == "" {
 				err := os.Setenv(env, ml.ModelPath)
 				if err != nil {
-					log.Error().Err(err).Str("name", env).Str("modelPath", ml.ModelPath).Msg("unable to set environment variable to modelPath")
+					xlog.Error("unable to set environment variable to modelPath", "error", err, "name", env, "modelPath", ml.ModelPath)
 				}
 			}
 		}
 
 		// Check if the backend is provided as external
-		if uri, ok := o.externalBackends[backend]; ok {
-			log.Debug().Msgf("Loading external backend: %s", uri)
-			// check if uri is a file or a address
+		if uri, ok := ml.GetAllExternalBackends(o)[backend]; ok {
+			xlog.Debug("Loading external backend", "uri", uri)
+			// check if uri is a file or an address
 			if fi, err := os.Stat(uri); err == nil {
-				log.Debug().Msgf("external backend is file: %+v", fi)
+				xlog.Debug("external backend is file", "file", fi)
 				serverAddress, err := getFreeAddress()
 				if err != nil {
 					return nil, fmt.Errorf("failed allocating free ports: %s", err.Error())
@@ -317,77 +95,43 @@ func (ml *ModelLoader) grpcModel(backend string, autodetect bool, o *Options) fu
 				// Make sure the process is executable
 				process, err := ml.startProcess(uri, modelID, serverAddress)
 				if err != nil {
-					log.Error().Err(err).Str("path", uri).Msg("failed to launch ")
+					xlog.Error("failed to launch", "error", err, "path", uri)
 					return nil, err
 				}
 
-				log.Debug().Msgf("GRPC Service Started")
+				xlog.Debug("GRPC Service Started")
 
 				client = NewModel(modelID, serverAddress, process)
 			} else {
-				log.Debug().Msg("external backend is a uri")
+				xlog.Debug("external backend is a uri")
 				// address
 				client = NewModel(modelID, uri, nil)
 			}
 		} else {
-			grpcProcess := backendPath(o.assetDir, backend)
-			if err := utils.VerifyPath(grpcProcess, o.assetDir); err != nil {
-				return nil, fmt.Errorf("refering to a backend not in asset dir: %s", err.Error())
-			}
-
-			if autodetect {
-				// autoDetect GRPC process to start based on system capabilities
-				if selectedProcess := selectGRPCProcessByHostCapabilities(backend, o.assetDir, o.gRPCOptions.F16Memory); selectedProcess != "" {
-					grpcProcess = selectedProcess
-				}
-			}
-
-			// Check if the file exists
-			if _, err := os.Stat(grpcProcess); os.IsNotExist(err) {
-				return nil, fmt.Errorf("backend not found: %s", grpcProcess)
-			}
-
-			serverAddress, err := getFreeAddress()
-			if err != nil {
-				return nil, fmt.Errorf("failed allocating free ports: %s", err.Error())
-			}
-
-			args := []string{}
-
-			// Load the ld.so if it exists
-			args, grpcProcess = library.LoadLDSO(o.assetDir, args, grpcProcess)
-
-			// Make sure the process is executable in any circumstance
-			process, err := ml.startProcess(grpcProcess, modelID, serverAddress, args...)
-			if err != nil {
-				return nil, err
-			}
-
-			log.Debug().Msgf("GRPC Service Started")
-
-			client = NewModel(modelID, serverAddress, process)
+			xlog.Error("Backend not found", "backend", backend)
+			return nil, fmt.Errorf("backend not found: %s", backend)
 		}
 
-		log.Debug().Msgf("Wait for the service to start up")
-		log.Debug().Msgf("Options: %+v", o.gRPCOptions)
+		xlog.Debug("Wait for the service to start up")
+		xlog.Debug("Options", "options", o.gRPCOptions)
 
 		// Wait for the service to start up
 		ready := false
-		for i := 0; i < o.grpcAttempts; i++ {
+		for i := range o.grpcAttempts {
 			alive, err := client.GRPC(o.parallelRequests, ml.wd).HealthCheck(context.Background())
 			if alive {
-				log.Debug().Msgf("GRPC Service Ready")
+				xlog.Debug("GRPC Service Ready")
 				ready = true
 				break
 			}
 			if err != nil && i == o.grpcAttempts-1 {
-				log.Error().Err(err).Msg("failed starting/connecting to the gRPC service")
+				xlog.Error("failed starting/connecting to the gRPC service", "error", err)
 			}
 			time.Sleep(time.Duration(o.grpcAttemptsDelay) * time.Second)
 		}
 
 		if !ready {
-			log.Debug().Msgf("GRPC Service NOT ready")
+			xlog.Debug("GRPC Service NOT ready")
 			if process := client.Process(); process != nil {
 				process.Stop()
 			}
@@ -399,7 +143,7 @@ func (ml *ModelLoader) grpcModel(backend string, autodetect bool, o *Options) fu
 		options.ModelFile = modelFile
 		options.ModelPath = ml.ModelPath
 
-		log.Debug().Msgf("GRPC: Loading model with options: %+v", options)
+		xlog.Debug("GRPC: Loading model with options", "options", options)
 
 		res, err := client.GRPC(o.parallelRequests, ml.wd).LoadModel(o.context, &options)
 		if err != nil {
@@ -419,141 +163,171 @@ func (ml *ModelLoader) grpcModel(backend string, autodetect bool, o *Options) fu
 	}
 }
 
-func (ml *ModelLoader) ListAvailableBackends(assetdir string) ([]string, error) {
-	backends, err := backendsInAssetDir(assetdir)
-	if err != nil {
-		return nil, err
-	}
-	return orderBackends(backends)
-}
-
 func (ml *ModelLoader) backendLoader(opts ...Option) (client grpc.Backend, err error) {
 	o := NewOptions(opts...)
 
-	log.Info().Str("modelID", o.modelID).Str("backend", o.backendString).Str("o.model", o.model).Msg("BackendLoader starting")
+	xlog.Info("BackendLoader starting", "modelID", o.modelID, "backend", o.backendString, "model", o.model)
 
 	backend := strings.ToLower(o.backendString)
 	if realBackend, exists := Aliases[backend]; exists {
 		typeAlias, exists := TypeAlias[backend]
 		if exists {
-			log.Debug().Msgf("'%s' is a type alias of '%s' (%s)", backend, realBackend, typeAlias)
+			xlog.Debug("alias is a type alias", "alias", backend, "realBackend", realBackend, "type", typeAlias)
 			o.gRPCOptions.Type = typeAlias
 		} else {
-			log.Debug().Msgf("'%s' is an alias of '%s'", backend, realBackend)
+			xlog.Debug("alias", "alias", backend, "realBackend", realBackend)
 		}
 
 		backend = realBackend
 	}
 
-	var backendToConsume string
-
-	switch backend {
-	case PiperBackend:
-		o.gRPCOptions.LibrarySearchPath = filepath.Join(o.assetDir, "backend-assets", "espeak-ng-data")
-		backendToConsume = PiperBackend
-	default:
-		backendToConsume = backend
-	}
-
-	model, err := ml.LoadModel(o.modelID, o.model, ml.grpcModel(backendToConsume, AutoDetect, o))
+	model, err := ml.LoadModel(o.modelID, o.model, ml.grpcModel(backend, o))
 	if err != nil {
-		model, err = attemptLoadingOnFailure(backend, ml, o, err)
-		if err != nil {
-			return nil, err
+		if stopErr := ml.StopGRPC(only(o.modelID)); stopErr != nil {
+			xlog.Error("error stopping model", "error", stopErr, "model", o.modelID)
 		}
+		xlog.Error("Failed to load model", "modelID", o.modelID, "error", err, "backend", o.backendString)
+		return nil, err
 	}
 
 	return model.GRPC(o.parallelRequests, ml.wd), nil
 }
 
-func (ml *ModelLoader) stopActiveBackends(modelID string, singleActiveBackend bool) {
-	if !singleActiveBackend {
+// enforceLRULimit enforces the LRU limit before loading a new model.
+// This is called before loading a model to ensure we don't exceed the limit.
+// It accounts for models that are currently being loaded by other goroutines.
+// If models are busy and can't be evicted, it will wait and retry until space is available.
+func (ml *ModelLoader) enforceLRULimit() {
+	if ml.wd == nil {
 		return
 	}
 
-	// If we can have only one backend active, kill all the others (except external backends)
+	// Get the count of models currently being loaded to account for concurrent requests
+	pendingLoads := ml.GetLoadingCount()
 
-	// Stop all backends except the one we are going to load
-	log.Debug().Msgf("Stopping all backends except '%s'", modelID)
-	err := ml.StopGRPC(allExcept(modelID))
-	if err != nil {
-		log.Error().Err(err).Str("keptModel", modelID).Msg("error while shutting down all backends except for the keptModel - greedyloader continuing")
+	// Get retry settings from ModelLoader
+	ml.mu.Lock()
+	maxRetries := ml.lruEvictionMaxRetries
+	retryInterval := ml.lruEvictionRetryInterval
+	ml.mu.Unlock()
+
+	for attempt := range maxRetries {
+		result := ml.wd.EnforceLRULimit(pendingLoads)
+
+		if !result.NeedMore {
+			// Successfully evicted enough models (or no eviction needed)
+			if result.EvictedCount > 0 {
+				xlog.Info("[ModelLoader] LRU enforcement complete", "evicted", result.EvictedCount)
+			}
+			return
+		}
+
+		// Need more evictions but models are busy - wait and retry
+		if attempt < maxRetries-1 {
+			xlog.Info("[ModelLoader] Waiting for busy models to become idle before eviction",
+				"evicted", result.EvictedCount,
+				"attempt", attempt+1,
+				"maxRetries", maxRetries,
+				"retryIn", retryInterval)
+			time.Sleep(retryInterval)
+		} else {
+			// Last attempt - log warning but proceed (might fail to load, but at least we tried)
+			xlog.Warn("[ModelLoader] LRU enforcement incomplete after max retries",
+				"evicted", result.EvictedCount,
+				"reason", "models are still busy with active API calls")
+		}
 	}
 }
 
-func (ml *ModelLoader) Close() {
-	if !ml.singletonMode {
+// updateModelLastUsed updates the last used time for a model (for LRU tracking)
+func (ml *ModelLoader) updateModelLastUsed(m *Model) {
+	if ml.wd == nil || m == nil {
 		return
 	}
-	ml.singletonLock.Unlock()
-}
-
-func (ml *ModelLoader) lockBackend() {
-	if !ml.singletonMode {
-		return
-	}
-	ml.singletonLock.Lock()
+	ml.wd.UpdateLastUsed(m.address)
 }
 
 func (ml *ModelLoader) Load(opts ...Option) (grpc.Backend, error) {
-	ml.lockBackend() // grab the singleton lock if needed
-
 	o := NewOptions(opts...)
 
 	// Return earlier if we have a model already loaded
 	// (avoid looping through all the backends)
 	if m := ml.CheckIsLoaded(o.modelID); m != nil {
-		log.Debug().Msgf("Model '%s' already loaded", o.modelID)
-
-		return m.GRPC(o.parallelRequests, ml.wd), nil
+		xlog.Debug("Model already loaded", "model", o.modelID)
+		// Update last used time for LRU tracking
+		ml.updateModelLastUsed(m)
+		client := m.GRPC(o.parallelRequests, ml.wd)
+		// Wrap remote models so connection errors during inference trigger eviction
+		if m.Process() == nil {
+			client = newConnectionEvictingClient(client, o.modelID, func() {
+				ml.ShutdownModel(o.modelID)
+			})
+		}
+		return client, nil
 	}
 
-	ml.stopActiveBackends(o.modelID, ml.singletonMode)
+	// Enforce LRU limit before loading a new model
+	ml.enforceLRULimit()
 
 	// if a backend is defined, return the loader directly
 	if o.backendString != "" {
-		return ml.backendLoader(opts...)
+		client, err := ml.backendLoader(opts...)
+		if err != nil {
+			return nil, err
+		}
+		// Wrap remote models so connection errors during inference trigger eviction
+		if m := ml.CheckIsLoaded(o.modelID); m != nil && m.Process() == nil {
+			client = newConnectionEvictingClient(client, o.modelID, func() {
+				ml.ShutdownModel(o.modelID)
+			})
+		}
+		return client, nil
 	}
 
 	// Otherwise scan for backends in the asset directory
 	var err error
 
 	// get backends embedded in the binary
-	autoLoadBackends, err := ml.ListAvailableBackends(o.assetDir)
-	if err != nil {
-		ml.Close() // we failed, release the lock
-		return nil, err
-	}
+	autoLoadBackends := []string{}
 
 	// append externalBackends supplied by the user via the CLI
-	for _, b := range o.externalBackends {
+	for b := range ml.GetAllExternalBackends(o) {
 		autoLoadBackends = append(autoLoadBackends, b)
 	}
 
-	log.Debug().Msgf("Loading from the following backends (in order): %+v", autoLoadBackends)
+	if len(autoLoadBackends) == 0 {
+		xlog.Error("No backends found")
+		return nil, fmt.Errorf("no backends found")
+	}
 
-	log.Info().Msgf("Trying to load the model '%s' with the backend '%s'", o.modelID, autoLoadBackends)
+	xlog.Debug("Loading from the following backends (in order)", "backends", autoLoadBackends)
+
+	xlog.Info("Trying to load the model", "modelID", o.modelID, "backends", autoLoadBackends)
 
 	for _, key := range autoLoadBackends {
-		log.Info().Msgf("[%s] Attempting to load", key)
+		xlog.Info("Attempting to load", "backend", key)
 		options := append(opts, []Option{
 			WithBackendString(key),
 		}...)
 
 		model, modelerr := ml.backendLoader(options...)
 		if modelerr == nil && model != nil {
-			log.Info().Msgf("[%s] Loads OK", key)
+			xlog.Info("Loads OK", "backend", key)
+			// Wrap remote models so connection errors during inference trigger eviction
+			if m := ml.CheckIsLoaded(o.modelID); m != nil && m.Process() == nil {
+				model = newConnectionEvictingClient(model, o.modelID, func() {
+					ml.ShutdownModel(o.modelID)
+				})
+			}
 			return model, nil
 		} else if modelerr != nil {
 			err = errors.Join(err, fmt.Errorf("[%s]: %w", key, modelerr))
-			log.Info().Msgf("[%s] Fails: %s", key, modelerr.Error())
+			xlog.Info("Fails", "backend", key, "error", modelerr.Error())
 		} else if model == nil {
 			err = errors.Join(err, fmt.Errorf("backend %s returned no usable model", key))
-			log.Info().Msgf("[%s] Fails: %s", key, "backend returned no usable model")
+			xlog.Info("Fails", "backend", key, "error", "backend returned no usable model")
 		}
 	}
-
-	ml.Close() // make sure to release the lock in case of failure
 
 	return nil, fmt.Errorf("could not load model - all backends returned error: %s", err.Error())
 }

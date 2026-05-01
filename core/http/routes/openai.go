@@ -1,118 +1,171 @@
 package routes
 
 import (
-	"github.com/gofiber/fiber/v2"
+	"github.com/labstack/echo/v4"
 	"github.com/mudler/LocalAI/core/application"
 	"github.com/mudler/LocalAI/core/config"
 	"github.com/mudler/LocalAI/core/http/endpoints/localai"
+	mcpTools "github.com/mudler/LocalAI/core/http/endpoints/mcp"
 	"github.com/mudler/LocalAI/core/http/endpoints/openai"
 	"github.com/mudler/LocalAI/core/http/middleware"
 	"github.com/mudler/LocalAI/core/schema"
 )
 
-func RegisterOpenAIRoutes(app *fiber.App,
+func RegisterOpenAIRoutes(app *echo.Echo,
 	re *middleware.RequestExtractor,
 	application *application.Application) {
 	// openAI compatible API endpoint
+	traceMiddleware := middleware.TraceMiddleware(application)
+	usageMiddleware := middleware.UsageMiddleware(application.AuthDB())
+
+	// realtime
+	// TODO: Modify/disable the API key middleware for this endpoint to allow ephemeral keys created by sessions
+	app.GET("/v1/realtime", openai.Realtime(application))
+	app.POST("/v1/realtime/sessions", openai.RealtimeTranscriptionSession(application), traceMiddleware)
+	app.POST("/v1/realtime/transcription_session", openai.RealtimeTranscriptionSession(application), traceMiddleware)
+	app.POST("/v1/realtime/calls", openai.RealtimeCalls(application), traceMiddleware)
+
+	// NATS client for distributed MCP tool routing (nil when not in distributed mode)
+	var natsClient mcpTools.MCPNATSClient
+	if d := application.Distributed(); d != nil {
+		natsClient = d.Nats
+	}
 
 	// chat
-	chatChain := []fiber.Handler{
+	chatHandler := openai.ChatEndpoint(application.ModelConfigLoader(), application.ModelLoader(), application.TemplatesEvaluator(), application.ApplicationConfig(), natsClient, application.LocalAIAssistant())
+	chatMiddleware := []echo.MiddlewareFunc{
+		usageMiddleware,
+		traceMiddleware,
 		re.BuildFilteredFirstAvailableDefaultModel(config.BuildUsecaseFilterFn(config.FLAG_CHAT)),
 		re.SetModelAndConfig(func() schema.LocalAIRequest { return new(schema.OpenAIRequest) }),
-		re.SetOpenAIRequest,
-		openai.ChatEndpoint(application.BackendLoader(), application.ModelLoader(), application.TemplatesEvaluator(), application.ApplicationConfig()),
+		func(next echo.HandlerFunc) echo.HandlerFunc {
+			return func(c echo.Context) error {
+				if err := re.SetOpenAIRequest(c); err != nil {
+					return err
+				}
+				return next(c)
+			}
+		},
 	}
-	app.Post("/v1/chat/completions", chatChain...)
-	app.Post("/chat/completions", chatChain...)
+	app.POST("/v1/chat/completions", chatHandler, chatMiddleware...)
+	app.POST("/chat/completions", chatHandler, chatMiddleware...)
 
 	// edit
-	editChain := []fiber.Handler{
+	editHandler := openai.EditEndpoint(application.ModelConfigLoader(), application.ModelLoader(), application.TemplatesEvaluator(), application.ApplicationConfig())
+	editMiddleware := []echo.MiddlewareFunc{
+		usageMiddleware,
+		traceMiddleware,
 		re.BuildFilteredFirstAvailableDefaultModel(config.BuildUsecaseFilterFn(config.FLAG_EDIT)),
 		re.BuildConstantDefaultModelNameMiddleware("gpt-4o"),
 		re.SetModelAndConfig(func() schema.LocalAIRequest { return new(schema.OpenAIRequest) }),
-		re.SetOpenAIRequest,
-		openai.EditEndpoint(application.BackendLoader(), application.ModelLoader(), application.TemplatesEvaluator(), application.ApplicationConfig()),
+		func(next echo.HandlerFunc) echo.HandlerFunc {
+			return func(c echo.Context) error {
+				if err := re.SetOpenAIRequest(c); err != nil {
+					return err
+				}
+				return next(c)
+			}
+		},
 	}
-	app.Post("/v1/edits", editChain...)
-	app.Post("/edits", editChain...)
+	app.POST("/v1/edits", editHandler, editMiddleware...)
+	app.POST("/edits", editHandler, editMiddleware...)
 
 	// completion
-	completionChain := []fiber.Handler{
+	completionHandler := openai.CompletionEndpoint(application.ModelConfigLoader(), application.ModelLoader(), application.TemplatesEvaluator(), application.ApplicationConfig())
+	completionMiddleware := []echo.MiddlewareFunc{
+		usageMiddleware,
+		traceMiddleware,
 		re.BuildFilteredFirstAvailableDefaultModel(config.BuildUsecaseFilterFn(config.FLAG_COMPLETION)),
 		re.BuildConstantDefaultModelNameMiddleware("gpt-4o"),
 		re.SetModelAndConfig(func() schema.LocalAIRequest { return new(schema.OpenAIRequest) }),
-		re.SetOpenAIRequest,
-		openai.CompletionEndpoint(application.BackendLoader(), application.ModelLoader(), application.TemplatesEvaluator(), application.ApplicationConfig()),
+		func(next echo.HandlerFunc) echo.HandlerFunc {
+			return func(c echo.Context) error {
+				if err := re.SetOpenAIRequest(c); err != nil {
+					return err
+				}
+				return next(c)
+			}
+		},
 	}
-	app.Post("/v1/completions", completionChain...)
-	app.Post("/completions", completionChain...)
-	app.Post("/v1/engines/:model/completions", completionChain...)
-
-	// assistant
-	app.Get("/v1/assistants", openai.ListAssistantsEndpoint(application.BackendLoader(), application.ModelLoader(), application.ApplicationConfig()))
-	app.Get("/assistants", openai.ListAssistantsEndpoint(application.BackendLoader(), application.ModelLoader(), application.ApplicationConfig()))
-	app.Post("/v1/assistants", openai.CreateAssistantEndpoint(application.BackendLoader(), application.ModelLoader(), application.ApplicationConfig()))
-	app.Post("/assistants", openai.CreateAssistantEndpoint(application.BackendLoader(), application.ModelLoader(), application.ApplicationConfig()))
-	app.Delete("/v1/assistants/:assistant_id", openai.DeleteAssistantEndpoint(application.BackendLoader(), application.ModelLoader(), application.ApplicationConfig()))
-	app.Delete("/assistants/:assistant_id", openai.DeleteAssistantEndpoint(application.BackendLoader(), application.ModelLoader(), application.ApplicationConfig()))
-	app.Get("/v1/assistants/:assistant_id", openai.GetAssistantEndpoint(application.BackendLoader(), application.ModelLoader(), application.ApplicationConfig()))
-	app.Get("/assistants/:assistant_id", openai.GetAssistantEndpoint(application.BackendLoader(), application.ModelLoader(), application.ApplicationConfig()))
-	app.Post("/v1/assistants/:assistant_id", openai.ModifyAssistantEndpoint(application.BackendLoader(), application.ModelLoader(), application.ApplicationConfig()))
-	app.Post("/assistants/:assistant_id", openai.ModifyAssistantEndpoint(application.BackendLoader(), application.ModelLoader(), application.ApplicationConfig()))
-	app.Get("/v1/assistants/:assistant_id/files", openai.ListAssistantFilesEndpoint(application.BackendLoader(), application.ModelLoader(), application.ApplicationConfig()))
-	app.Get("/assistants/:assistant_id/files", openai.ListAssistantFilesEndpoint(application.BackendLoader(), application.ModelLoader(), application.ApplicationConfig()))
-	app.Post("/v1/assistants/:assistant_id/files", openai.CreateAssistantFileEndpoint(application.BackendLoader(), application.ModelLoader(), application.ApplicationConfig()))
-	app.Post("/assistants/:assistant_id/files", openai.CreateAssistantFileEndpoint(application.BackendLoader(), application.ModelLoader(), application.ApplicationConfig()))
-	app.Delete("/v1/assistants/:assistant_id/files/:file_id", openai.DeleteAssistantFileEndpoint(application.BackendLoader(), application.ModelLoader(), application.ApplicationConfig()))
-	app.Delete("/assistants/:assistant_id/files/:file_id", openai.DeleteAssistantFileEndpoint(application.BackendLoader(), application.ModelLoader(), application.ApplicationConfig()))
-	app.Get("/v1/assistants/:assistant_id/files/:file_id", openai.GetAssistantFileEndpoint(application.BackendLoader(), application.ModelLoader(), application.ApplicationConfig()))
-	app.Get("/assistants/:assistant_id/files/:file_id", openai.GetAssistantFileEndpoint(application.BackendLoader(), application.ModelLoader(), application.ApplicationConfig()))
-
-	// files
-	app.Post("/v1/files", openai.UploadFilesEndpoint(application.BackendLoader(), application.ApplicationConfig()))
-	app.Post("/files", openai.UploadFilesEndpoint(application.BackendLoader(), application.ApplicationConfig()))
-	app.Get("/v1/files", openai.ListFilesEndpoint(application.BackendLoader(), application.ApplicationConfig()))
-	app.Get("/files", openai.ListFilesEndpoint(application.BackendLoader(), application.ApplicationConfig()))
-	app.Get("/v1/files/:file_id", openai.GetFilesEndpoint(application.BackendLoader(), application.ApplicationConfig()))
-	app.Get("/files/:file_id", openai.GetFilesEndpoint(application.BackendLoader(), application.ApplicationConfig()))
-	app.Delete("/v1/files/:file_id", openai.DeleteFilesEndpoint(application.BackendLoader(), application.ApplicationConfig()))
-	app.Delete("/files/:file_id", openai.DeleteFilesEndpoint(application.BackendLoader(), application.ApplicationConfig()))
-	app.Get("/v1/files/:file_id/content", openai.GetFilesContentsEndpoint(application.BackendLoader(), application.ApplicationConfig()))
-	app.Get("/files/:file_id/content", openai.GetFilesContentsEndpoint(application.BackendLoader(), application.ApplicationConfig()))
+	app.POST("/v1/completions", completionHandler, completionMiddleware...)
+	app.POST("/completions", completionHandler, completionMiddleware...)
+	app.POST("/v1/engines/:model/completions", completionHandler, completionMiddleware...)
 
 	// embeddings
-	embeddingChain := []fiber.Handler{
+	embeddingHandler := openai.EmbeddingsEndpoint(application.ModelConfigLoader(), application.ModelLoader(), application.ApplicationConfig())
+	embeddingMiddleware := []echo.MiddlewareFunc{
+		usageMiddleware,
+		traceMiddleware,
 		re.BuildFilteredFirstAvailableDefaultModel(config.BuildUsecaseFilterFn(config.FLAG_EMBEDDINGS)),
 		re.BuildConstantDefaultModelNameMiddleware("gpt-4o"),
 		re.SetModelAndConfig(func() schema.LocalAIRequest { return new(schema.OpenAIRequest) }),
-		re.SetOpenAIRequest,
-		openai.EmbeddingsEndpoint(application.BackendLoader(), application.ModelLoader(), application.ApplicationConfig()),
+		func(next echo.HandlerFunc) echo.HandlerFunc {
+			return func(c echo.Context) error {
+				if err := re.SetOpenAIRequest(c); err != nil {
+					return err
+				}
+				return next(c)
+			}
+		},
 	}
-	app.Post("/v1/embeddings", embeddingChain...)
-	app.Post("/embeddings", embeddingChain...)
-	app.Post("/v1/engines/:model/embeddings", embeddingChain...)
+	app.POST("/v1/embeddings", embeddingHandler, embeddingMiddleware...)
+	app.POST("/embeddings", embeddingHandler, embeddingMiddleware...)
+	app.POST("/v1/engines/:model/embeddings", embeddingHandler, embeddingMiddleware...)
 
-	// audio
-	app.Post("/v1/audio/transcriptions",
+	audioHandler := openai.TranscriptEndpoint(application.ModelConfigLoader(), application.ModelLoader(), application.ApplicationConfig())
+	audioMiddleware := []echo.MiddlewareFunc{
+		traceMiddleware,
 		re.BuildFilteredFirstAvailableDefaultModel(config.BuildUsecaseFilterFn(config.FLAG_TRANSCRIPT)),
 		re.SetModelAndConfig(func() schema.LocalAIRequest { return new(schema.OpenAIRequest) }),
-		re.SetOpenAIRequest,
-		openai.TranscriptEndpoint(application.BackendLoader(), application.ModelLoader(), application.ApplicationConfig()),
-	)
+		func(next echo.HandlerFunc) echo.HandlerFunc {
+			return func(c echo.Context) error {
+				if err := re.SetOpenAIRequest(c); err != nil {
+					return err
+				}
+				return next(c)
+			}
+		},
+	}
+	// audio
+	app.POST("/v1/audio/transcriptions", audioHandler, audioMiddleware...)
+	app.POST("/audio/transcriptions", audioHandler, audioMiddleware...)
 
-	app.Post("/v1/audio/speech",
+	audioSpeechHandler := localai.TTSEndpoint(application.ModelConfigLoader(), application.ModelLoader(), application.ApplicationConfig())
+	audioSpeechMiddleware := []echo.MiddlewareFunc{
+		traceMiddleware,
 		re.BuildFilteredFirstAvailableDefaultModel(config.BuildUsecaseFilterFn(config.FLAG_TTS)),
 		re.SetModelAndConfig(func() schema.LocalAIRequest { return new(schema.TTSRequest) }),
-		localai.TTSEndpoint(application.BackendLoader(), application.ModelLoader(), application.ApplicationConfig()))
+	}
+
+	app.POST("/v1/audio/speech", audioSpeechHandler, audioSpeechMiddleware...)
+	app.POST("/audio/speech", audioSpeechHandler, audioSpeechMiddleware...)
 
 	// images
-	app.Post("/v1/images/generations",
-		re.BuildConstantDefaultModelNameMiddleware("stablediffusion"),
+	imageHandler := openai.ImageEndpoint(application.ModelConfigLoader(), application.ModelLoader(), application.ApplicationConfig())
+	imageMiddleware := []echo.MiddlewareFunc{
+		traceMiddleware,
+		// Default: use the first available image generation model
+		re.BuildFilteredFirstAvailableDefaultModel(config.BuildUsecaseFilterFn(config.FLAG_IMAGE)),
 		re.SetModelAndConfig(func() schema.LocalAIRequest { return new(schema.OpenAIRequest) }),
-		re.SetOpenAIRequest,
-		openai.ImageEndpoint(application.BackendLoader(), application.ModelLoader(), application.ApplicationConfig()))
+		func(next echo.HandlerFunc) echo.HandlerFunc {
+			return func(c echo.Context) error {
+				if err := re.SetOpenAIRequest(c); err != nil {
+					return err
+				}
+				return next(c)
+			}
+		},
+	}
+
+	app.POST("/v1/images/generations", imageHandler, imageMiddleware...)
+	app.POST("/images/generations", imageHandler, imageMiddleware...)
+
+	// inpainting endpoint (image + mask) - reuse same middleware config as images
+	inpaintingHandler := openai.InpaintingEndpoint(application.ModelConfigLoader(), application.ModelLoader(), application.ApplicationConfig())
+	app.POST("/v1/images/inpainting", inpaintingHandler, imageMiddleware...)
+	app.POST("/images/inpainting", inpaintingHandler, imageMiddleware...)
 
 	// List models
-	app.Get("/v1/models", openai.ListModelsEndpoint(application.BackendLoader(), application.ModelLoader(), application.ApplicationConfig()))
-	app.Get("/models", openai.ListModelsEndpoint(application.BackendLoader(), application.ModelLoader(), application.ApplicationConfig()))
+	app.GET("/v1/models", openai.ListModelsEndpoint(application.ModelConfigLoader(), application.ModelLoader(), application.ApplicationConfig(), application.AuthDB()))
+	app.GET("/models", openai.ListModelsEndpoint(application.ModelConfigLoader(), application.ModelLoader(), application.ApplicationConfig(), application.AuthDB()))
 }

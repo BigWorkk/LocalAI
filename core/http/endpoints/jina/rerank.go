@@ -1,40 +1,54 @@
 package jina
 
 import (
+	"net/http"
+
+	"github.com/labstack/echo/v4"
 	"github.com/mudler/LocalAI/core/backend"
 	"github.com/mudler/LocalAI/core/config"
 	"github.com/mudler/LocalAI/core/http/middleware"
-
-	"github.com/gofiber/fiber/v2"
 	"github.com/mudler/LocalAI/core/schema"
 	"github.com/mudler/LocalAI/pkg/grpc/proto"
 	"github.com/mudler/LocalAI/pkg/model"
-	"github.com/rs/zerolog/log"
+	"github.com/mudler/xlog"
 )
 
 // JINARerankEndpoint acts like the Jina reranker endpoint (https://jina.ai/reranker/)
 // @Summary Reranks a list of phrases by relevance to a given text query.
+// @Tags rerank
 // @Param request body schema.JINARerankRequest true "query params"
 // @Success 200 {object} schema.JINARerankResponse "Response"
 // @Router /v1/rerank [post]
-func JINARerankEndpoint(cl *config.BackendConfigLoader, ml *model.ModelLoader, appConfig *config.ApplicationConfig) func(c *fiber.Ctx) error {
-	return func(c *fiber.Ctx) error {
+func JINARerankEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, appConfig *config.ApplicationConfig) echo.HandlerFunc {
+	return func(c echo.Context) error {
 
-		input, ok := c.Locals(middleware.CONTEXT_LOCALS_KEY_LOCALAI_REQUEST).(*schema.JINARerankRequest)
+		input, ok := c.Get(middleware.CONTEXT_LOCALS_KEY_LOCALAI_REQUEST).(*schema.JINARerankRequest)
 		if !ok || input.Model == "" {
-			return fiber.ErrBadRequest
+			return echo.ErrBadRequest
 		}
 
-		cfg, ok := c.Locals(middleware.CONTEXT_LOCALS_KEY_MODEL_CONFIG).(*config.BackendConfig)
+		cfg, ok := c.Get(middleware.CONTEXT_LOCALS_KEY_MODEL_CONFIG).(*config.ModelConfig)
 		if !ok || cfg == nil {
-			return fiber.ErrBadRequest
+			return echo.ErrBadRequest
 		}
 
-		log.Debug().Str("model", input.Model).Msg("JINA Rerank Request received")
-
+		xlog.Debug("JINA Rerank Request received", "model", input.Model)
+		var requestTopN int32
+		docs := int32(len(input.Documents))
+		if input.TopN == nil { // omit top_n to get all
+			requestTopN = docs
+		} else {
+			requestTopN = int32(*input.TopN)
+			if requestTopN < 1 {
+				return c.JSON(http.StatusUnprocessableEntity, "top_n - should be greater than or equal to 1")
+			}
+			if requestTopN > docs { // make it more obvious for backends
+				requestTopN = docs
+			}
+		}
 		request := &proto.RerankRequest{
 			Query:     input.Query,
-			TopN:      int32(input.TopN),
+			TopN:      requestTopN,
 			Documents: input.Documents,
 		}
 
@@ -58,6 +72,6 @@ func JINARerankEndpoint(cl *config.BackendConfigLoader, ml *model.ModelLoader, a
 		response.Usage.TotalTokens = int(results.Usage.TotalTokens)
 		response.Usage.PromptTokens = int(results.Usage.PromptTokens)
 
-		return c.Status(fiber.StatusOK).JSON(response)
+		return c.JSON(http.StatusOK, response)
 	}
 }

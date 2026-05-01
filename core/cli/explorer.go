@@ -7,6 +7,8 @@ import (
 	cliContext "github.com/mudler/LocalAI/core/cli/context"
 	"github.com/mudler/LocalAI/core/explorer"
 	"github.com/mudler/LocalAI/core/http"
+	"github.com/mudler/LocalAI/pkg/signals"
+	"github.com/mudler/xlog"
 )
 
 type ExplorerCMD struct {
@@ -45,5 +47,13 @@ func (e *ExplorerCMD) Run(ctx *cliContext.Context) error {
 
 	appHTTP := http.Explorer(db)
 
-	return appHTTP.Listen(e.Address)
+	signals.RegisterGracefulTerminationHandler(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := appHTTP.Shutdown(ctx); err != nil {
+			xlog.Error("error during shutdown", "error", err)
+		}
+	})
+
+	return appHTTP.Start(e.Address)
 }

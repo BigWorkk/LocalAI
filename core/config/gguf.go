@@ -1,25 +1,17 @@
 package config
 
 import (
-	"strings"
+	"context"
 
+	"github.com/mudler/LocalAI/pkg/functions"
+	"github.com/mudler/LocalAI/pkg/grpc"
+	pb "github.com/mudler/LocalAI/pkg/grpc/proto"
+	"github.com/mudler/LocalAI/pkg/reasoning"
 	"github.com/mudler/LocalAI/pkg/xsysinfo"
-	"github.com/rs/zerolog/log"
+	"github.com/mudler/xlog"
 
 	gguf "github.com/gpustack/gguf-parser-go"
-)
-
-type familyType uint8
-
-const (
-	Unknown familyType = iota
-	LLaMa3
-	CommandR
-	Phi3
-	ChatML
-	Mistral03
-	Gemma
-	DeepSeek2
+	"github.com/gpustack/gguf-parser-go/util/ptr"
 )
 
 const (
@@ -27,126 +19,7 @@ const (
 	defaultNGPULayers  = 99999999
 )
 
-type settingsConfig struct {
-	StopWords      []string
-	TemplateConfig TemplateConfig
-	RepeatPenalty  float64
-}
-
-// default settings to adopt with a given model family
-var defaultsSettings map[familyType]settingsConfig = map[familyType]settingsConfig{
-	Gemma: {
-		RepeatPenalty: 1.0,
-		StopWords:     []string{"<|im_end|>", "<end_of_turn>", "<start_of_turn>"},
-		TemplateConfig: TemplateConfig{
-			Chat:        "{{.Input }}\n<start_of_turn>model\n",
-			ChatMessage: "<start_of_turn>{{if eq .RoleName \"assistant\" }}model{{else}}{{ .RoleName }}{{end}}\n{{ if .Content -}}\n{{.Content -}}\n{{ end -}}<end_of_turn>",
-			Completion:  "{{.Input}}",
-		},
-	},
-	DeepSeek2: {
-		StopWords: []string{"<｜end▁of▁sentence｜>"},
-		TemplateConfig: TemplateConfig{
-			ChatMessage: `{{if eq .RoleName "user" -}}User: {{.Content }}
-{{ end -}}
-{{if eq .RoleName "assistant" -}}Assistant: {{.Content}}<｜end▁of▁sentence｜>{{end}}
-{{if eq .RoleName "system" -}}{{.Content}}
-{{end -}}`,
-			Chat: "{{.Input -}}\nAssistant: ",
-		},
-	},
-	LLaMa3: {
-		StopWords: []string{"<|eot_id|>"},
-		TemplateConfig: TemplateConfig{
-			Chat:        "<|begin_of_text|>{{.Input }}\n<|start_header_id|>assistant<|end_header_id|>",
-			ChatMessage: "<|start_header_id|>{{ .RoleName }}<|end_header_id|>\n\n{{.Content }}<|eot_id|>",
-		},
-	},
-	CommandR: {
-		TemplateConfig: TemplateConfig{
-			Chat: "{{.Input -}}<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>",
-			Functions: `<|START_OF_TURN_TOKEN|><|SYSTEM_TOKEN|>
-You are a function calling AI model, you can call the following functions:
-## Available Tools
-{{range .Functions}}
-- {"type": "function", "function": {"name": "{{.Name}}", "description": "{{.Description}}", "parameters": {{toJson .Parameters}} }}
-{{end}}
-When using a tool, reply with JSON, for instance {"name": "tool_name", "arguments": {"param1": "value1", "param2": "value2"}}
-<|END_OF_TURN_TOKEN|><|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>{{.Input -}}`,
-			ChatMessage: `{{if eq .RoleName "user" -}}
-<|START_OF_TURN_TOKEN|><|USER_TOKEN|>{{.Content}}<|END_OF_TURN_TOKEN|>
-{{- else if eq .RoleName "system" -}}
-<|START_OF_TURN_TOKEN|><|SYSTEM_TOKEN|>{{.Content}}<|END_OF_TURN_TOKEN|>
-{{- else if eq .RoleName "assistant" -}}
-<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>{{.Content}}<|END_OF_TURN_TOKEN|>
-{{- else if eq .RoleName "tool" -}}
-<|START_OF_TURN_TOKEN|><|SYSTEM_TOKEN|>{{.Content}}<|END_OF_TURN_TOKEN|>
-{{- else if .FunctionCall -}}
-<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>{{toJson .FunctionCall}}}<|END_OF_TURN_TOKEN|>
-{{- end -}}`,
-		},
-		StopWords: []string{"<|END_OF_TURN_TOKEN|>"},
-	},
-	Phi3: {
-		TemplateConfig: TemplateConfig{
-			Chat:        "{{.Input}}\n<|assistant|>",
-			ChatMessage: "<|{{ .RoleName }}|>\n{{.Content}}<|end|>",
-			Completion:  "{{.Input}}",
-		},
-		StopWords: []string{"<|end|>", "<|endoftext|>"},
-	},
-	ChatML: {
-		TemplateConfig: TemplateConfig{
-			Chat: "{{.Input -}}\n<|im_start|>assistant",
-			Functions: `<|im_start|>system
-You are a function calling AI model. You are provided with functions to execute. You may call one or more functions to assist with the user query. Don't make assumptions about what values to plug into functions. Here are the available tools:
-{{range .Functions}}
-{'type': 'function', 'function': {'name': '{{.Name}}', 'description': '{{.Description}}', 'parameters': {{toJson .Parameters}} }}
-{{end}}
-For each function call return a json object with function name and arguments
-<|im_end|>
-{{.Input -}}
-<|im_start|>assistant`,
-			ChatMessage: `<|im_start|>{{ .RoleName }}
-{{ if .FunctionCall -}}
-Function call:
-{{ else if eq .RoleName "tool" -}}
-Function response:
-{{ end -}}
-{{ if .Content -}}
-{{.Content }}
-{{ end -}}
-{{ if .FunctionCall -}}
-{{toJson .FunctionCall}}
-{{ end -}}<|im_end|>`,
-		},
-		StopWords: []string{"<|im_end|>", "<dummy32000>", "</s>"},
-	},
-	Mistral03: {
-		TemplateConfig: TemplateConfig{
-			Chat:      "{{.Input -}}",
-			Functions: `[AVAILABLE_TOOLS] [{{range .Functions}}{"type": "function", "function": {"name": "{{.Name}}", "description": "{{.Description}}", "parameters": {{toJson .Parameters}} }}{{end}} ] [/AVAILABLE_TOOLS]{{.Input }}`,
-			ChatMessage: `{{if eq .RoleName "user" -}}
-[INST] {{.Content }} [/INST]
-{{- else if .FunctionCall -}}
-[TOOL_CALLS] {{toJson .FunctionCall}} [/TOOL_CALLS]
-{{- else if eq .RoleName "tool" -}}
-[TOOL_RESULTS] {{.Content}} [/TOOL_RESULTS]
-{{- else -}}
-{{ .Content -}}
-{{ end -}}`,
-		},
-		StopWords: []string{"<|im_end|>", "<dummy32000>", "</tool_call>", "<|eot_id|>", "<|end_of_text|>", "</s>", "[/TOOL_CALLS]", "[/ACTIONS]"},
-	},
-}
-
-// this maps well known template used in HF to model families defined above
-var knownTemplates = map[string]familyType{
-	`{% if messages[0]['role'] == 'system' %}{% set system_message = messages[0]['content'] %}{% endif %}{% if system_message is defined %}{{ system_message }}{% endif %}{% for message in messages %}{% set content = message['content'] %}{% if message['role'] == 'user' %}{{ '<|im_start|>user\n' + content + '<|im_end|>\n<|im_start|>assistant\n' }}{% elif message['role'] == 'assistant' %}{{ content + '<|im_end|>' + '\n' }}{% endif %}{% endfor %}`:                              ChatML,
-	`{{ bos_token }}{% for message in messages %}{% if (message['role'] == 'user') != (loop.index0 % 2 == 0) %}{{ raise_exception('Conversation roles must alternate user/assistant/user/assistant/...') }}{% endif %}{% if message['role'] == 'user' %}{{ '[INST] ' + message['content'] + ' [/INST]' }}{% elif message['role'] == 'assistant' %}{{ message['content'] + eos_token}}{% else %}{{ raise_exception('Only user and assistant roles are supported!') }}{% endif %}{% endfor %}`: Mistral03,
-}
-
-func guessGGUFFromFile(cfg *BackendConfig, f *gguf.GGUFFile, defaultCtx int) {
+func guessGGUFFromFile(cfg *ModelConfig, f *gguf.GGUFFile, defaultCtx int) {
 
 	if defaultCtx == 0 && cfg.ContextSize == nil {
 		ctxSize := f.EstimateLLaMACppRun().ContextSize
@@ -166,131 +39,163 @@ func guessGGUFFromFile(cfg *BackendConfig, f *gguf.GGUFFile, defaultCtx int) {
 		}
 	}
 
-	// vram estimation
-	vram, err := xsysinfo.TotalAvailableVRAM()
-	if err != nil {
-		log.Error().Msgf("guessDefaultsFromFile(TotalAvailableVRAM): %s", err)
-	} else if vram > 0 {
-		estimate, err := xsysinfo.EstimateGGUFVRAMUsage(f, vram)
-		if err != nil {
-			log.Error().Msgf("guessDefaultsFromFile(EstimateGGUFVRAMUsage): %s", err)
-		} else {
-			if estimate.IsFullOffload {
-				log.Warn().Msgf("guessDefaultsFromFile: %s", "full offload is recommended")
-			}
-
-			if estimate.EstimatedVRAM > vram {
-				log.Warn().Msgf("guessDefaultsFromFile: %s", "estimated VRAM usage is greater than available VRAM")
-			}
-
-			if cfg.NGPULayers == nil && estimate.EstimatedLayers > 0 {
-				log.Debug().Msgf("guessDefaultsFromFile: %d layers estimated", estimate.EstimatedLayers)
-				cfg.NGPULayers = &estimate.EstimatedLayers
-			}
-		}
-	}
-
 	if cfg.NGPULayers == nil {
 		// we assume we want to offload all layers
 		defaultHigh := defaultNGPULayers
 		cfg.NGPULayers = &defaultHigh
 	}
 
-	log.Debug().Any("NGPULayers", cfg.NGPULayers).Msgf("guessDefaultsFromFile: %s", "NGPULayers set")
+	xlog.Debug("[gguf] guessDefaultsFromFile: NGPULayers set", "NGPULayers", cfg.NGPULayers, "modelName", f.Metadata().Name)
+
+	// identify from well known templates first, otherwise use the raw jinja template
+	chatTemplate, found := f.Header.MetadataKV.Get("tokenizer.chat_template")
+	if found {
+		// fill jinja template
+		cfg.modelTemplate = chatTemplate.ValueString()
+	}
+
+	// Thinking support detection is done after model load via DetectThinkingSupportFromBackend
 
 	// template estimations
 	if cfg.HasTemplate() {
 		// nothing to guess here
-		log.Debug().Any("name", cfg.Name).Msgf("guessDefaultsFromFile: %s", "template already set")
+		xlog.Debug("[gguf] guessDefaultsFromFile: template already set", "name", cfg.Name, "modelName", f.Metadata().Name)
 		return
 	}
 
-	log.Debug().
-		Any("eosTokenID", f.Tokenizer().EOSTokenID).
-		Any("bosTokenID", f.Tokenizer().BOSTokenID).
-		Any("modelName", f.Metadata().Name).
-		Any("architecture", f.Architecture().Architecture).Msgf("Model file loaded: %s", cfg.ModelFileName())
+	xlog.Debug("[gguf] Model file loaded", "file", cfg.ModelFileName(), "eosTokenID", f.Tokenizer().EOSTokenID, "bosTokenID", f.Tokenizer().BOSTokenID, "modelName", f.Metadata().Name, "architecture", f.Architecture().Architecture)
 
 	// guess the name
 	if cfg.Name == "" {
 		cfg.Name = f.Metadata().Name
 	}
 
-	family := identifyFamily(f)
+	// Instruct to use template from llama.cpp
+	cfg.TemplateConfig.UseTokenizerTemplate = true
+	cfg.FunctionsConfig.GrammarConfig.NoGrammar = true
+	cfg.Options = append(cfg.Options, "use_jinja:true")
+	cfg.KnownUsecaseStrings = append(cfg.KnownUsecaseStrings, "FLAG_CHAT")
 
-	if family == Unknown {
-		log.Debug().Msgf("guessDefaultsFromFile: %s", "family not identified")
-		return
-	}
-
-	// identify template
-	settings, ok := defaultsSettings[family]
-	if ok {
-		cfg.TemplateConfig = settings.TemplateConfig
-		log.Debug().Any("family", family).Msgf("guessDefaultsFromFile: guessed template %+v", cfg.TemplateConfig)
-		if len(cfg.StopWords) == 0 {
-			cfg.StopWords = settings.StopWords
-		}
-		if cfg.RepeatPenalty == 0.0 {
-			cfg.RepeatPenalty = settings.RepeatPenalty
-		}
-	} else {
-		log.Debug().Any("family", family).Msgf("guessDefaultsFromFile: no template found for family")
-	}
-
-	if cfg.HasTemplate() {
-		return
-	}
-
-	// identify from well known templates first, otherwise use the raw jinja template
-	chatTemplate, found := f.Header.MetadataKV.Get("tokenizer.chat_template")
-	if found {
-		// try to use the jinja template
-		cfg.TemplateConfig.JinjaTemplate = true
-		cfg.TemplateConfig.ChatMessage = chatTemplate.ValueString()
-	}
-
+	// Apply per-model-family inference parameter defaults (temperature, top_p, etc.)
+	ApplyInferenceDefaults(cfg, f.Metadata().Name)
 }
 
-func identifyFamily(f *gguf.GGUFFile) familyType {
+// DetectThinkingSupportFromBackend calls the ModelMetadata gRPC method to detect
+// if the model supports thinking mode and if the template ends with a thinking start token.
+// This should be called after the model is loaded.
+// The results are stored in cfg.SupportsThinking and cfg.ThinkingForcedOpen.
+// The backend-reported multimodal marker is also captured into cfg.MediaMarker.
+func DetectThinkingSupportFromBackend(ctx context.Context, cfg *ModelConfig, backendClient grpc.Backend, modelOptions *pb.ModelOptions) {
+	if backendClient == nil {
+		xlog.Debug("[gguf] DetectThinkingSupportFromBackend: backend client is nil, skipping detection")
+		return
+	}
 
-	// identify from well known templates first
-	chatTemplate, found := f.Header.MetadataKV.Get("tokenizer.chat_template")
-	if found && chatTemplate.ValueString() != "" {
-		if family, ok := knownTemplates[chatTemplate.ValueString()]; ok {
-			return family
+	if modelOptions == nil {
+		xlog.Debug("[gguf] DetectThinkingSupportFromBackend: model options is nil, skipping detection")
+		return
+	}
+
+	// Only llama-cpp exposes ModelMetadata today. Other backends will either error
+	// or return an empty response — both are fine, we just bail before calling.
+	if cfg.Backend != "llama-cpp" {
+		xlog.Debug("[gguf] DetectThinkingSupportFromBackend: skipping detection", "backend", cfg.Backend)
+		return
+	}
+
+	metadata, err := backendClient.ModelMetadata(ctx, modelOptions)
+	if err != nil {
+		xlog.Warn("[gguf] DetectThinkingSupportFromBackend: failed to get model metadata", "error", err)
+		return
+	}
+
+	if metadata != nil {
+		// The multimodal media marker is backend-controlled (llama.cpp may pick a
+		// random per-server string). Empty means "no mtmd context" — Go falls back
+		// to templates.DefaultMultiMediaMarker at render time.
+		if metadata.MediaMarker != "" {
+			cfg.MediaMarker = metadata.MediaMarker
+			xlog.Debug("[gguf] DetectThinkingSupportFromBackend: media marker captured", "marker", metadata.MediaMarker)
+		}
+
+		// Thinking / tool-format detection only applies when we rely on the
+		// backend-side tokenizer template — otherwise the rendered-template based
+		// heuristics below aren't meaningful.
+		if !cfg.TemplateConfig.UseTokenizerTemplate {
+			return
+		}
+
+		applyDetectedThinkingConfig(cfg, metadata)
+
+		// Extract tool format markers from autoparser analysis
+		if tf := metadata.GetToolFormat(); tf != nil && tf.FormatType != "" {
+			cfg.FunctionsConfig.ToolFormatMarkers = &functions.ToolFormatMarkers{
+				FormatType:        tf.FormatType,
+				SectionStart:      tf.SectionStart,
+				SectionEnd:        tf.SectionEnd,
+				PerCallStart:      tf.PerCallStart,
+				PerCallEnd:        tf.PerCallEnd,
+				FuncNamePrefix:    tf.FuncNamePrefix,
+				FuncNameSuffix:    tf.FuncNameSuffix,
+				FuncClose:         tf.FuncClose,
+				ArgNamePrefix:     tf.ArgNamePrefix,
+				ArgNameSuffix:     tf.ArgNameSuffix,
+				ArgValuePrefix:    tf.ArgValuePrefix,
+				ArgValueSuffix:    tf.ArgValueSuffix,
+				ArgSeparator:      tf.ArgSeparator,
+				ArgsStart:         tf.ArgsStart,
+				ArgsEnd:           tf.ArgsEnd,
+				NameField:         tf.NameField,
+				ArgsField:         tf.ArgsField,
+				IDField:           tf.IdField,
+				FunNameIsKey:      tf.FunNameIsKey,
+				ToolsArrayWrapped: tf.ToolsArrayWrapped,
+				FunctionField:     tf.FunctionField,
+				ParameterOrder:    tf.ParameterOrder,
+				GenIDField:        tf.GenIdField,
+				CallIDPosition:    tf.CallIdPosition,
+				CallIDPrefix:      tf.CallIdPrefix,
+				CallIDSuffix:      tf.CallIdSuffix,
+				ReasoningStart:    tf.ReasoningStart,
+				ReasoningEnd:      tf.ReasoningEnd,
+				ContentStart:      tf.ContentStart,
+				ContentEnd:        tf.ContentEnd,
+			}
+			xlog.Debug("[gguf] DetectThinkingSupportFromBackend: tool format markers detected",
+				"format_type", tf.FormatType,
+				"section_start", tf.SectionStart,
+				"func_name_prefix", tf.FuncNamePrefix)
 		}
 	}
+}
 
-	// otherwise try to identify from the model properties
-	arch := f.Architecture().Architecture
-	eosTokenID := f.Tokenizer().EOSTokenID
-	bosTokenID := f.Tokenizer().BOSTokenID
-
-	isYI := arch == "llama" && bosTokenID == 1 && eosTokenID == 2
-	// WTF! Mistral0.3 and isYi have same bosTokenID and eosTokenID
-
-	llama3 := arch == "llama" && eosTokenID == 128009
-	commandR := arch == "command-r" && eosTokenID == 255001
-	qwen2 := arch == "qwen2"
-	phi3 := arch == "phi-3"
-	gemma := strings.HasPrefix(arch, "gemma") || strings.Contains(strings.ToLower(f.Metadata().Name), "gemma")
-	deepseek2 := arch == "deepseek2"
-
-	switch {
-	case deepseek2:
-		return DeepSeek2
-	case gemma:
-		return Gemma
-	case llama3:
-		return LLaMa3
-	case commandR:
-		return CommandR
-	case phi3:
-		return Phi3
-	case qwen2, isYI:
-		return ChatML
-	default:
-		return Unknown
+func applyDetectedThinkingConfig(cfg *ModelConfig, metadata *pb.ModelMetadataResponse) {
+	if cfg == nil || metadata == nil {
+		return
 	}
+
+	// Respect explicit YAML/user config. Backend probing should only fill defaults
+	// when the reasoning mode has not already been set.
+	if cfg.ReasoningConfig.DisableReasoning == nil {
+		cfg.ReasoningConfig.DisableReasoning = ptr.To(!metadata.SupportsThinking)
+	}
+
+	// Respect explicit prefill config for the same reason. Only infer the
+	// default prefill behavior when the user did not set it.
+	if cfg.ReasoningConfig.DisableReasoningTagPrefill == nil {
+		// Use the rendered template to detect if thinking token is at the end.
+		// This reuses the existing DetectThinkingStartToken function.
+		if metadata.RenderedTemplate != "" {
+			thinkingStartToken := reasoning.DetectThinkingStartToken(metadata.RenderedTemplate, &cfg.ReasoningConfig)
+			thinkingForcedOpen := thinkingStartToken != ""
+			cfg.ReasoningConfig.DisableReasoningTagPrefill = ptr.To(!thinkingForcedOpen)
+			xlog.Debug("[gguf] DetectThinkingSupportFromBackend: thinking support detected", "supports_thinking", metadata.SupportsThinking, "thinking_forced_open", thinkingForcedOpen, "thinking_start_token", thinkingStartToken)
+		} else {
+			cfg.ReasoningConfig.DisableReasoningTagPrefill = ptr.To(true)
+			xlog.Debug("[gguf] DetectThinkingSupportFromBackend: thinking support detected", "supports_thinking", metadata.SupportsThinking, "thinking_forced_open", false)
+		}
+		return
+	}
+
+	xlog.Debug("[gguf] DetectThinkingSupportFromBackend: preserving explicit reasoning config", "supports_thinking", metadata.SupportsThinking, "disable_reasoning", *cfg.ReasoningConfig.DisableReasoning, "disable_reasoning_tag_prefill", *cfg.ReasoningConfig.DisableReasoningTagPrefill)
 }

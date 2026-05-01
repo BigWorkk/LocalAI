@@ -3,45 +3,171 @@ package model
 import (
 	"context"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	pb "github.com/mudler/LocalAI/pkg/grpc/proto"
+	"github.com/mudler/LocalAI/pkg/system"
 	"github.com/mudler/LocalAI/pkg/utils"
 
-	"github.com/rs/zerolog/log"
+	"github.com/mudler/xlog"
 )
 
 // new idea: what if we declare a struct of these here, and use a loop to check?
 
 // TODO: Split ModelLoader and TemplateLoader? Just to keep things more organized. Left together to share a mutex until I look into that. Would split if we separate directories for .bin/.yaml and .tmpl
-type ModelLoader struct {
-	ModelPath     string
-	mu            sync.Mutex
-	singletonLock sync.Mutex
-	singletonMode bool
-	models        map[string]*Model
-	wd            *WatchDog
+// ModelUnloadHook is called when a model is about to be unloaded.
+// The model name is passed as the argument.
+type ModelUnloadHook func(modelName string)
+
+// RemoteModelUnloader handles unloading models from remote backend nodes.
+// In distributed mode, this is implemented by the SmartRouter.
+// When ShutdownModel is called for a model with no local process,
+// RemoteModelUnloader.UnloadRemoteModel is called to tell the remote node to free it.
+type RemoteModelUnloader interface {
+	UnloadRemoteModel(modelName string) error
 }
 
-func NewModelLoader(modelPath string, singleActiveBackend bool) *ModelLoader {
+// ModelRouter is a callback that routes model loading to a remote node
+// instead of starting a local process. When set on the ModelLoader,
+// grpcModel() will delegate to this function before attempting local loading.
+type ModelRouter func(ctx context.Context, backend, modelID, modelName, modelFile string,
+	opts *pb.ModelOptions, parallel bool) (*Model, error)
+
+type ModelLoader struct {
+	ModelPath                string
+	mu                       sync.Mutex
+	store                    ModelStore
+	loading                  map[string]chan struct{} // tracks models currently being loaded
+	wd                       *WatchDog
+	externalBackends         map[string]string
+	lruEvictionMaxRetries    int           // Maximum number of retries when waiting for busy models
+	lruEvictionRetryInterval time.Duration // Interval between retries when waiting for busy models
+	onUnloadHooks            []ModelUnloadHook
+	remoteUnloader           RemoteModelUnloader
+	modelRouter              ModelRouter // distributed mode: route to remote node
+	backendLogs              *BackendLogStore
+	backendLoggingEnabled    atomic.Bool
+}
+
+// NewModelLoader creates a new ModelLoader instance.
+// LRU eviction is now managed through the WatchDog component.
+func NewModelLoader(system *system.SystemState) *ModelLoader {
 	nml := &ModelLoader{
-		ModelPath:     modelPath,
-		models:        make(map[string]*Model),
-		singletonMode: singleActiveBackend,
+		ModelPath:                system.Model.ModelsPath,
+		store:                    NewInMemoryModelStore(),
+		loading:                  make(map[string]chan struct{}),
+		externalBackends:         make(map[string]string),
+		lruEvictionMaxRetries:    30,              // Default: 30 retries
+		lruEvictionRetryInterval: 1 * time.Second, // Default: 1 second
+		backendLogs:              NewBackendLogStore(1000),
 	}
 
 	return nml
 }
 
+// GetLoadingCount returns the number of models currently being loaded
+func (ml *ModelLoader) GetLoadingCount() int {
+	ml.mu.Lock()
+	defer ml.mu.Unlock()
+	return len(ml.loading)
+}
+
+// OnModelUnload registers a hook that is called when a model is unloaded.
+func (ml *ModelLoader) OnModelUnload(hook ModelUnloadHook) {
+	ml.mu.Lock()
+	defer ml.mu.Unlock()
+	ml.onUnloadHooks = append(ml.onUnloadHooks, hook)
+}
+
 func (ml *ModelLoader) SetWatchDog(wd *WatchDog) {
+	ml.mu.Lock()
+	defer ml.mu.Unlock()
 	ml.wd = wd
+}
+
+// SetRemoteUnloader sets the handler for unloading models on remote nodes.
+// In distributed mode, this should be set to the SmartRouter adapter.
+func (ml *ModelLoader) SetRemoteUnloader(u RemoteModelUnloader) {
+	ml.mu.Lock()
+	defer ml.mu.Unlock()
+	ml.remoteUnloader = u
+}
+
+// SetModelRouter sets the distributed model router callback.
+// When set, grpcModel() will delegate to this function before attempting local loading.
+func (ml *ModelLoader) SetModelRouter(r ModelRouter) {
+	ml.mu.Lock()
+	defer ml.mu.Unlock()
+	ml.modelRouter = r
+}
+
+// SetModelStore replaces the default in-memory model store.
+// In distributed mode this is called with a DistributedModelStore.
+func (ml *ModelLoader) SetModelStore(s ModelStore) {
+	ml.mu.Lock()
+	defer ml.mu.Unlock()
+	ml.store = s
+}
+
+func (ml *ModelLoader) GetWatchDog() *WatchDog {
+	return ml.wd
+}
+
+func (ml *ModelLoader) BackendLogs() *BackendLogStore {
+	return ml.backendLogs
+}
+
+func (ml *ModelLoader) SetBackendLoggingEnabled(enabled bool) {
+	ml.backendLoggingEnabled.Store(enabled)
+}
+
+func (ml *ModelLoader) BackendLoggingEnabled() bool {
+	return ml.backendLoggingEnabled.Load()
+}
+
+// SetLRUEvictionRetrySettings updates the LRU eviction retry settings
+func (ml *ModelLoader) SetLRUEvictionRetrySettings(maxRetries int, retryInterval time.Duration) {
+	ml.mu.Lock()
+	defer ml.mu.Unlock()
+	ml.lruEvictionMaxRetries = maxRetries
+	ml.lruEvictionRetryInterval = retryInterval
 }
 
 func (ml *ModelLoader) ExistsInModelPath(s string) bool {
 	return utils.ExistsInPath(ml.ModelPath, s)
+}
+
+func (ml *ModelLoader) SetExternalBackend(name, uri string) {
+	ml.mu.Lock()
+	defer ml.mu.Unlock()
+	ml.externalBackends[name] = uri
+}
+
+func (ml *ModelLoader) DeleteExternalBackend(name string) {
+	ml.mu.Lock()
+	defer ml.mu.Unlock()
+	delete(ml.externalBackends, name)
+}
+
+func (ml *ModelLoader) GetExternalBackend(name string) string {
+	ml.mu.Lock()
+	defer ml.mu.Unlock()
+	return ml.externalBackends[name]
+}
+
+func (ml *ModelLoader) GetAllExternalBackends(o *Options) map[string]string {
+	backends := make(map[string]string)
+	maps.Copy(backends, ml.externalBackends)
+	if o != nil {
+		maps.Copy(backends, o.externalBackends)
+	}
+	return backends
 }
 
 var knownFilesToSkip []string = []string{
@@ -64,6 +190,12 @@ var knownModelsNameSuffixToSkip []string = []string{
 	".DS_Store",
 	".",
 	".safetensors",
+	".bin",
+	".gguf",
+	".ggml",
+	".ckpt",
+	".zip",
+	".tag",
 	".partial",
 	".tar.gz",
 }
@@ -104,30 +236,62 @@ FILE:
 	return models, nil
 }
 
-func (ml *ModelLoader) ListModels() []*Model {
+func (ml *ModelLoader) ListLoadedModels() []*Model {
 	ml.mu.Lock()
 	defer ml.mu.Unlock()
 
 	models := []*Model{}
-	for _, model := range ml.models {
-		models = append(models, model)
-	}
+	ml.store.Range(func(_ string, m *Model) bool {
+		models = append(models, m)
+		return true
+	})
 
 	return models
 }
 
 func (ml *ModelLoader) LoadModel(modelID, modelName string, loader func(string, string, string) (*Model, error)) (*Model, error) {
+	ml.mu.Lock()
+
 	// Check if we already have a loaded model
-	if model := ml.CheckIsLoaded(modelID); model != nil {
+	if model := ml.checkIsLoaded(modelID); model != nil {
+		ml.mu.Unlock()
 		return model, nil
 	}
 
-	// Load the model and keep it in memory for later use
-	modelFile := filepath.Join(ml.ModelPath, modelName)
-	log.Debug().Msgf("Loading model in memory from file: %s", modelFile)
+	// Check if another goroutine is already loading this model
+	if loadingChan, isLoading := ml.loading[modelID]; isLoading {
+		ml.mu.Unlock()
+		// Wait for the other goroutine to finish loading
+		xlog.Debug("Waiting for model to be loaded by another request", "modelID", modelID)
+		<-loadingChan
+		// Now check if the model is loaded
+		ml.mu.Lock()
+		model := ml.checkIsLoaded(modelID)
+		ml.mu.Unlock()
+		if model != nil {
+			return model, nil
+		}
+		// If still not loaded, the other goroutine failed - we'll try again
+		return ml.LoadModel(modelID, modelName, loader)
+	}
 
-	ml.mu.Lock()
-	defer ml.mu.Unlock()
+	// Mark this model as loading (create a channel that will be closed when done)
+	loadingChan := make(chan struct{})
+	ml.loading[modelID] = loadingChan
+	ml.mu.Unlock()
+
+	// Ensure we clean up the loading state when done
+	defer func() {
+		ml.mu.Lock()
+		delete(ml.loading, modelID)
+		close(loadingChan)
+		ml.mu.Unlock()
+	}()
+
+	// Load the model (this can take a long time, no lock held)
+	modelFile := filepath.Join(ml.ModelPath, modelName)
+	xlog.Debug("Loading model in memory from file", "file", modelFile)
+
 	model, err := loader(modelID, modelName, modelFile)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load model with internal loader: %s", err)
@@ -137,7 +301,10 @@ func (ml *ModelLoader) LoadModel(modelID, modelName string, loader func(string, 
 		return nil, fmt.Errorf("loader didn't return a model")
 	}
 
-	ml.models[modelID] = model
+	// Add to models map
+	ml.mu.Lock()
+	ml.store.Set(modelID, model)
+	ml.mu.Unlock()
 
 	return model, nil
 }
@@ -152,37 +319,61 @@ func (ml *ModelLoader) ShutdownModel(modelName string) error {
 func (ml *ModelLoader) CheckIsLoaded(s string) *Model {
 	ml.mu.Lock()
 	defer ml.mu.Unlock()
-	m, ok := ml.models[s]
+	return ml.checkIsLoaded(s)
+}
+
+func (ml *ModelLoader) checkIsLoaded(s string) *Model {
+	m, ok := ml.store.Get(s)
 	if !ok {
 		return nil
 	}
 
-	log.Debug().Msgf("Model already loaded in memory: %s", s)
+	xlog.Debug("Model already loaded in memory", "model", s)
+
+	// Skip the gRPC health check if the model was recently verified.
+	// This avoids serializing concurrent requests behind ml.mu while each
+	// one does a network round-trip (especially costly in distributed mode).
+	if m.IsRecentlyHealthy() {
+		xlog.Debug("Model health check cached, skipping gRPC probe", "model", s)
+		return m
+	}
+
 	client := m.GRPC(false, ml.wd)
 
-	log.Debug().Msgf("Checking model availability (%s)", s)
+	xlog.Debug("Checking model availability", "model", s)
 	cTimeout, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
 	alive, err := client.HealthCheck(cTimeout)
 	if !alive {
-		log.Warn().Msgf("GRPC Model not responding: %s", err.Error())
-		log.Warn().Msgf("Deleting the process in order to recreate it")
+		xlog.Warn("GRPC Model not responding", "error", err)
+		xlog.Warn("Deleting the process in order to recreate it")
 		process := m.Process()
 		if process == nil {
-			log.Error().Msgf("Process not found for '%s' and the model is not responding anymore !", s)
+			// Remote/distributed model — no local process to check.
+			// Only evict on definitive connection errors (node is down).
+			// Timeouts may mean the node is busy, so keep the model cached.
+			if isConnectionError(err) {
+				xlog.Warn("Remote model unreachable (connection error), removing from cache", "model", s, "error", err)
+				if delErr := ml.deleteProcess(s); delErr != nil {
+					xlog.Error("error cleaning up remote model", "error", delErr, "model", s)
+				}
+				return nil
+			}
+			xlog.Warn("Remote model health check failed (possible timeout), keeping cached", "model", s, "error", err)
 			return m
 		}
 		if !process.IsAlive() {
-			log.Debug().Msgf("GRPC Process is not responding: %s", s)
+			xlog.Debug("GRPC Process is not responding", "model", s)
 			// stop and delete the process, this forces to re-load the model and re-create again the service
 			err := ml.deleteProcess(s)
 			if err != nil {
-				log.Error().Err(err).Str("process", s).Msg("error stopping process")
+				xlog.Error("error stopping process", "error", err, "process", s)
 			}
 			return nil
 		}
 	}
 
+	m.MarkHealthy()
 	return m
 }

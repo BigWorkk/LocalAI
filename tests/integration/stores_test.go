@@ -2,26 +2,20 @@ package integration_test
 
 import (
 	"context"
-	"embed"
 	"math"
-	"math/rand"
+	"math/rand/v2"
 	"os"
-	"path/filepath"
 
+	"github.com/mudler/xlog"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	"github.com/rs/zerolog"
-	"github.com/rs/zerolog/log"
 
 	"github.com/mudler/LocalAI/core/config"
-	"github.com/mudler/LocalAI/pkg/assets"
 	"github.com/mudler/LocalAI/pkg/grpc"
 	"github.com/mudler/LocalAI/pkg/model"
 	"github.com/mudler/LocalAI/pkg/store"
+	"github.com/mudler/LocalAI/pkg/system"
 )
-
-//go:embed backend-assets/*
-var backendAssets embed.FS
 
 func normalize(vecs [][]float32) {
 	for i, k := range vecs {
@@ -45,20 +39,12 @@ var _ = Describe("Integration tests for the stores backend(s) and internal APIs"
 		BeforeEach(func() {
 			var err error
 
-			zerolog.SetGlobalLevel(zerolog.DebugLevel)
-
 			tmpdir, err = os.MkdirTemp("", "")
-			Expect(err).ToNot(HaveOccurred())
-			backendAssetsDir := filepath.Join(tmpdir, "backend-assets")
-			err = os.Mkdir(backendAssetsDir, 0750)
-			Expect(err).ToNot(HaveOccurred())
-
-			err = assets.ExtractFiles(backendAssets, backendAssetsDir)
 			Expect(err).ToNot(HaveOccurred())
 
 			debug := true
 
-			bc := config.BackendConfig{
+			bc := config.ModelConfig{
 				Name:    "store test",
 				Debug:   &debug,
 				Backend: model.LocalStoreBackend,
@@ -66,11 +52,15 @@ var _ = Describe("Integration tests for the stores backend(s) and internal APIs"
 
 			storeOpts := []model.Option{
 				model.WithBackendString(bc.Backend),
-				model.WithAssetDir(backendAssetsDir),
 				model.WithModel("test"),
 			}
 
-			sl = model.NewModelLoader("", false)
+			systemState, err := system.GetSystemState(
+				system.WithModelPath(tmpdir),
+			)
+			Expect(err).ToNot(HaveOccurred())
+
+			sl = model.NewModelLoader(systemState)
 			sc, err = sl.Load(storeOpts...)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(sc).ToNot(BeNil())
@@ -194,7 +184,7 @@ var _ = Describe("Integration tests for the stores backend(s) and internal APIs"
 
 			for i, k := range keys {
 				s := sims[i]
-				log.Debug().Float32("similarity", s).Msgf("key: %v", k)
+				xlog.Debug("key", "similarity", s, "key", k)
 			}
 
 			Expect(keys[0]).To(Equal([]float32{0.5, 0.5, 0.5}))
@@ -221,7 +211,7 @@ var _ = Describe("Integration tests for the stores backend(s) and internal APIs"
 
 			for i, k := range ks {
 				s := sims[i]
-				log.Debug().Float32("similarity", s).Msgf("key: %v", k)
+				xlog.Debug("key", "similarity", s, "key", k)
 			}
 
 			Expect(ks[0]).To(Equal(keys[0]))
@@ -321,7 +311,7 @@ var _ = Describe("Integration tests for the stores backend(s) and internal APIs"
 		})
 
 		It("It obeys the triangle inequality", func() {
-			rnd := rand.New(rand.NewSource(151))
+			rnd := rand.New(rand.NewPCG(151, 0))
 			keys := make([][]float32, 20)
 			vals := make([][]byte, 20)
 

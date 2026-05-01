@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-This is an extra gRPC server of LocalAI for Bark TTS
+This is an extra gRPC server of LocalAI for Faster Whisper TTS
 """
 from concurrent import futures
 import time
@@ -10,10 +10,14 @@ import sys
 import os
 import backend_pb2
 import backend_pb2_grpc
-
+import torch
 from faster_whisper import WhisperModel
 
 import grpc
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'common'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'common'))
+from grpc_auth import get_auth_interceptors
+
 
 
 _ONE_DAY_IN_SECONDS = 60 * 60 * 24
@@ -35,10 +39,12 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
         # device = "cuda" if request.CUDA else "cpu"
         if request.CUDA:
             device = "cuda"
-
+        mps_available = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+        if mps_available:
+            device = "mps"
         try:
             print("Preparing models, please wait", file=sys.stderr)
-            self.model = WhisperModel(request.Model, device=device, compute_type="float16")
+            self.model = WhisperModel(request.Model, device=device, compute_type="default")
         except Exception as err:
             return backend_pb2.Result(success=False, message=f"Unexpected {err=}, {type(err)=}")
         # Implement your logic here for the LoadModel service
@@ -53,11 +59,12 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
             id = 0
             for segment in segments:
                 print("[%.2fs -> %.2fs] %s" % (segment.start, segment.end, segment.text))
-                resultSegments.append(backend_pb2.TranscriptSegment(id=id, start=segment.start, end=segment.end, text=segment.text))
+                resultSegments.append(backend_pb2.TranscriptSegment(id=id, start=int(segment.start)*1e9, end=int(segment.end)*1e9, text=segment.text))
                 text += segment.text
-                id += 1            
+                id += 1
         except Exception as err:
             print(f"Unexpected {err=}, {type(err)=}", file=sys.stderr)
+            raise err
 
         return backend_pb2.TranscriptResult(segments=resultSegments, text=text)
 
@@ -67,7 +74,9 @@ def serve(address):
             ('grpc.max_message_length', 50 * 1024 * 1024),  # 50MB
             ('grpc.max_send_message_length', 50 * 1024 * 1024),  # 50MB
             ('grpc.max_receive_message_length', 50 * 1024 * 1024),  # 50MB
-        ])
+        ],
+        interceptors=get_auth_interceptors(),
+    )
     backend_pb2_grpc.add_BackendServicer_to_server(BackendServicer(), server)
     server.add_insecure_port(address)
     server.start()

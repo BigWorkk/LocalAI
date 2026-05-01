@@ -7,9 +7,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/rs/zerolog/log"
+	"github.com/mudler/xlog"
 
 	"github.com/mudler/LocalAI/core/p2p"
+	"github.com/mudler/LocalAI/core/schema"
 	"github.com/mudler/edgevpn/pkg/blockchain"
 )
 
@@ -56,21 +57,21 @@ func (s *DiscoveryServer) runBackground() {
 		// do not do in parallel
 		n, err := p2p.NewNode(token)
 		if err != nil {
-			log.Err(err).Msg("Failed to create node")
+			xlog.Error("Failed to create node", "error", err)
 			s.failedToken(token)
 			continue
 		}
 
 		err = n.Start(c)
 		if err != nil {
-			log.Err(err).Msg("Failed to start node")
+			xlog.Error("Failed to start node", "error", err)
 			s.failedToken(token)
 			continue
 		}
 
 		ledger, err := n.Ledger()
 		if err != nil {
-			log.Err(err).Msg("Failed to start ledger")
+			xlog.Error("Failed to start ledger", "error", err)
 			s.failedToken(token)
 			continue
 		}
@@ -91,10 +92,10 @@ func (s *DiscoveryServer) runBackground() {
 			}
 		}
 
-		log.Debug().Any("network", token).Msgf("Network has %d clusters", len(ledgerK))
+		xlog.Debug("Network clusters", "network", token, "count", len(ledgerK))
 		if len(ledgerK) != 0 {
 			for _, k := range ledgerK {
-				log.Debug().Any("network", token).Msgf("Clusterdata %+v", k)
+				xlog.Debug("Clusterdata", "network", token, "cluster", k)
 			}
 		}
 
@@ -127,7 +128,7 @@ func (s *DiscoveryServer) deleteFailedConnections() {
 	for _, t := range s.database.TokenList() {
 		data, _ := s.database.Get(t)
 		if data.Failures > s.errorThreshold {
-			log.Info().Any("token", t).Msg("Token has been removed from the database")
+			xlog.Info("Token has been removed from the database", "token", t)
 			s.database.Delete(t)
 		}
 	}
@@ -155,7 +156,7 @@ func (s *DiscoveryServer) retrieveNetworkData(c context.Context, ledger *blockch
 			for d := range data {
 				toScanForWorkers := false
 				cd := ClusterData{}
-				isWorkerCluster := d == p2p.WorkerID || (strings.Contains(d, "_") && strings.Contains(d, p2p.WorkerID))
+				isWorkerCluster := d == p2p.LlamaCPPWorkerID || (strings.Contains(d, "_") && strings.Contains(d, p2p.LlamaCPPWorkerID))
 				isFederatedCluster := d == p2p.FederatedID || (strings.Contains(d, "_") && strings.Contains(d, p2p.FederatedID))
 				switch {
 				case isWorkerCluster:
@@ -177,7 +178,7 @@ func (s *DiscoveryServer) retrieveNetworkData(c context.Context, ledger *blockch
 				atLeastOneWorker := false
 			DATA:
 				for _, v := range data[d] {
-					nd := &p2p.NodeData{}
+					nd := &schema.NodeData{}
 					if err := v.Unmarshal(nd); err != nil {
 						continue DATA
 					}

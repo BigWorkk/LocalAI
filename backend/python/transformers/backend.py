@@ -16,17 +16,22 @@ import backend_pb2
 import backend_pb2_grpc
 
 import grpc
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'common'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'common'))
+from grpc_auth import get_auth_interceptors
+
 import torch
 import torch.cuda
 
 
 XPU=os.environ.get("XPU", "0") == "1"
-from transformers import AutoTokenizer, AutoModel, set_seed, TextIteratorStreamer, StoppingCriteriaList, StopStringCriteria, MambaConfig, MambaForCausalLM
-from transformers import AutoProcessor, MusicgenForConditionalGeneration
+import transformers as transformers_module
+from transformers import AutoTokenizer, AutoModel, AutoProcessor, set_seed, TextIteratorStreamer, StoppingCriteriaList, StopStringCriteria
 from scipy.io import wavfile
-import outetts
 from sentence_transformers import SentenceTransformer
 
+# Backward-compat aliases for model types
+TYPE_ALIASES = {"Mamba": "MambaForCausalLM"}
 
 _ONE_DAY_IN_SECONDS = 60 * 60 * 24
 
@@ -53,32 +58,11 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
     This class implements the gRPC methods for the backend service, including Health, LoadModel, and Embedding.
     """
     def Health(self, request, context):
-        """
-        A gRPC method that returns the health status of the backend service.
-
-        Args:
-            request: A HealthRequest object that contains the request parameters.
-            context: A grpc.ServicerContext object that provides information about the RPC.
-
-        Returns:
-            A Reply object that contains the health status of the backend service.
-        """
         return backend_pb2.Reply(message=bytes("OK", 'utf-8'))
 
     def LoadModel(self, request, context):
-        """
-        A gRPC method that loads a model into memory.
-
-        Args:
-            request: A LoadModelRequest object that contains the request parameters.
-            context: A grpc.ServicerContext object that provides information about the RPC.
-
-        Returns:
-            A Result object that contains the result of the LoadModel operation.
-        """
-
         model_name = request.Model
-        
+
         # Check to see if the Model exists in the filesystem already.
         if os.path.exists(request.ModelFile):
             model_name = request.ModelFile
@@ -89,16 +73,43 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
 
         self.CUDA = torch.cuda.is_available()
         self.OV=False
-        self.OuteTTS=False
+        self.GenericTTS=False
         self.SentenceTransformer = False
+        self.processor = None
 
         device_map="cpu"
-
+        mps_available = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+        if mps_available:
+            device_map = "mps"
         quantization = None
         autoTokenizer = True
 
+        # Parse options from request.Options
+        self.options = {}
+        options = request.Options
+
+        # The options are a list of strings in this form optname:optvalue
+        # We are storing all the options in a dict so we can use it later when generating
+        # Example options: ["max_new_tokens:3072", "guidance_scale:3.0", "temperature:1.8", "top_p:0.90", "top_k:45"]
+        for opt in options:
+            if ":" not in opt:
+                continue
+            key, value = opt.split(":", 1)
+            # if value is a number, convert it to the appropriate type
+            try:
+                if "." in value:
+                    value = float(value)
+                else:
+                    value = int(value)
+            except ValueError:
+                # Keep as string if conversion fails
+                pass
+            self.options[key] = value
+
+        print(f"Parsed options: {self.options}", file=sys.stderr)
+
         if self.CUDA:
-            from transformers import BitsAndBytesConfig, AutoModelForCausalLM
+            from transformers import BitsAndBytesConfig
             if request.MainGPU:
                 device_map=request.MainGPU
             else:
@@ -115,40 +126,31 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
                 quantization = BitsAndBytesConfig(
                     load_in_4bit=False,
                     bnb_4bit_compute_dtype = None,
-                    load_in_8bit=True,                                   
+                    load_in_8bit=True,
                 )
 
         try:
-            if request.Type == "AutoModelForCausalLM":
-                if XPU:
-                    import intel_extension_for_pytorch as ipex
-                    from intel_extension_for_transformers.transformers.modeling import AutoModelForCausalLM
+            if XPU and request.Type == "AutoModelForCausalLM":
+                import intel_extension_for_pytorch as ipex
+                from intel_extension_for_transformers.transformers.modeling import AutoModelForCausalLM
 
-                    device_map="xpu"
-                    compute=torch.float16
-                    if request.Quantization == "xpu_4bit":
-                        xpu_4bit = True
-                        xpu_8bit = False
-                    elif request.Quantization == "xpu_8bit":
-                        xpu_4bit = False
-                        xpu_8bit = True
-                    else:
-                        xpu_4bit = False
-                        xpu_8bit = False
-                    self.model = AutoModelForCausalLM.from_pretrained(model_name, 
-                                                                      trust_remote_code=request.TrustRemoteCode, 
-                                                                      use_safetensors=True,
-                                                                      device_map=device_map, 
-                                                                      load_in_4bit=xpu_4bit, 
-                                                                      load_in_8bit=xpu_8bit, 
-                                                                      torch_dtype=compute)
+                device_map="xpu"
+                compute=torch.float16
+                if request.Quantization == "xpu_4bit":
+                    xpu_4bit = True
+                    xpu_8bit = False
+                elif request.Quantization == "xpu_8bit":
+                    xpu_4bit = False
+                    xpu_8bit = True
                 else:
-                    self.model = AutoModelForCausalLM.from_pretrained(model_name, 
-                                                                      trust_remote_code=request.TrustRemoteCode, 
-                                                                      use_safetensors=True, 
-                                                                      quantization_config=quantization, 
-                                                                      device_map=device_map, 
-                                                                      torch_dtype=compute)
+                    xpu_4bit = False
+                    xpu_8bit = False
+                self.model = AutoModelForCausalLM.from_pretrained(model_name,
+                                                                  trust_remote_code=request.TrustRemoteCode,
+                                                                  device_map=device_map,
+                                                                  load_in_4bit=xpu_4bit,
+                                                                  load_in_8bit=xpu_8bit,
+                                                                  torch_dtype=compute)
             elif request.Type == "OVModelForCausalLM":
                 from optimum.intel.openvino import OVModelForCausalLM
                 from openvino.runtime import Core
@@ -160,14 +162,12 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
                     devices = Core().available_devices
                     if "GPU" in " ".join(devices):
                         device_map="AUTO:GPU"
-                # While working on a fine tuned model, inference may give an inaccuracy and performance drop on GPU if winograd convolutions are selected. 
-                # https://docs.openvino.ai/2024/openvino-workflow/running-inference/inference-devices-and-modes/gpu-device.html
                 if "CPU" or "NPU" in device_map:
                     if "-CPU" or "-NPU" not in device_map:
                         ovconfig={"PERFORMANCE_HINT": "CUMULATIVE_THROUGHPUT"}
                 else:
                     ovconfig={"PERFORMANCE_HINT": "CUMULATIVE_THROUGHPUT","GPU_DISABLE_WINOGRAD_CONVOLUTION": "YES"}
-                self.model = OVModelForCausalLM.from_pretrained(model_name, 
+                self.model = OVModelForCausalLM.from_pretrained(model_name,
                                                                 compile=True,
                                                                 trust_remote_code=request.TrustRemoteCode,
                                                                 ov_config=ovconfig,
@@ -184,88 +184,60 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
                     devices = Core().available_devices
                     if "GPU" in " ".join(devices):
                         device_map="AUTO:GPU"
-                # While working on a fine tuned model, inference may give an inaccuracy and performance drop on GPU if winograd convolutions are selected. 
-                # https://docs.openvino.ai/2024/openvino-workflow/running-inference/inference-devices-and-modes/gpu-device.html
                 if "CPU" or "NPU" in device_map:
                     if "-CPU" or "-NPU" not in device_map:
                         ovconfig={"PERFORMANCE_HINT": "CUMULATIVE_THROUGHPUT"}
                 else:
                     ovconfig={"PERFORMANCE_HINT": "CUMULATIVE_THROUGHPUT","GPU_DISABLE_WINOGRAD_CONVOLUTION": "YES"}
-                self.model = OVModelForFeatureExtraction.from_pretrained(model_name, 
+                self.model = OVModelForFeatureExtraction.from_pretrained(model_name,
                                                                 compile=True,
                                                                 trust_remote_code=request.TrustRemoteCode,
-                                                                ov_config=ovconfig, 
+                                                                ov_config=ovconfig,
                                                                 export=True,
                                                                 device=device_map)
                 self.OV = True
-            elif request.Type == "MusicgenForConditionalGeneration":
-                autoTokenizer = False
-                self.processor = AutoProcessor.from_pretrained(model_name)
-                self.model = MusicgenForConditionalGeneration.from_pretrained(model_name)
-            elif request.Type == "OuteTTS":
-                autoTokenizer = False
-                options = request.Options
-                MODELNAME = "OuteAI/OuteTTS-0.3-1B"
-                TOKENIZER = "OuteAI/OuteTTS-0.3-1B"
-                VERSION = "0.3"
-                SPEAKER = "en_male_1"
-                for opt in options:
-                    if opt.startswith("tokenizer:"):
-                        TOKENIZER = opt.split(":")[1]
-                        break
-                    if opt.startswith("version:"):
-                        VERSION = opt.split(":")[1]
-                        break
-                    if opt.startswith("speaker:"):
-                        SPEAKER = opt.split(":")[1]
-                        break
-                
-                if model_name != "":
-                    MODELNAME = model_name
-
-                # Configure the model
-                model_config = outetts.HFModelConfig_v2(
-                    model_path=MODELNAME,
-                    tokenizer_path=TOKENIZER
-                )
-                # Initialize the interface
-                self.interface = outetts.InterfaceHF(model_version=VERSION, cfg=model_config)
-                self.OuteTTS = True
-
-                self.interface.print_default_speakers()
-                if request.AudioPath:
-                    if os.path.isabs(request.AudioPath):
-                        self.AudioPath = request.AudioPath
-                    else:
-                        self.AudioPath = os.path.join(request.ModelPath, request.AudioPath)
-                    self.speaker = self.interface.create_speaker(audio_path=self.AudioPath)
-                else:
-                    self.speaker = self.interface.load_default_speaker(name=SPEAKER)               
             elif request.Type == "SentenceTransformer":
                 autoTokenizer = False
                 self.model = SentenceTransformer(model_name, trust_remote_code=request.TrustRemoteCode)
                 self.SentenceTransformer = True
-            elif request.Type == "Mamba":
-                autoTokenizer = False
-                self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-                self.model = MambaForCausalLM.from_pretrained(model_name)
             else:
-                print("Automodel", file=sys.stderr)
-                self.model = AutoModel.from_pretrained(model_name, 
-                                                       trust_remote_code=request.TrustRemoteCode,  
-                                                       use_safetensors=True,  
-                                                       quantization_config=quantization, 
-                                                       device_map=device_map, 
-                                                       torch_dtype=compute)
+                # Generic: dynamically resolve model class from transformers
+                model_type = TYPE_ALIASES.get(request.Type, request.Type)
+                ModelClass = AutoModel  # default
+                if model_type and hasattr(transformers_module, model_type):
+                    ModelClass = getattr(transformers_module, model_type)
+                    print(f"Using model class: {model_type}", file=sys.stderr)
+                else:
+                    print(f"Using default AutoModel (type={request.Type!r})", file=sys.stderr)
+
+                self.model = ModelClass.from_pretrained(
+                    model_name,
+                    trust_remote_code=request.TrustRemoteCode,
+                    quantization_config=quantization,
+                    device_map=device_map,
+                    torch_dtype=compute,
+                )
+
+                # Try to load a processor (needed for TTS/audio models)
+                try:
+                    self.processor = AutoProcessor.from_pretrained(
+                        model_name,
+                        trust_remote_code=request.TrustRemoteCode,
+                    )
+                    self.GenericTTS = True
+                    print(f"Loaded processor for {model_name}", file=sys.stderr)
+                except Exception:
+                    self.processor = None
+
             if request.ContextSize > 0:
                 self.max_tokens = request.ContextSize
             elif hasattr(self.model, 'config') and hasattr(self.model.config, 'max_position_embeddings'):
                 self.max_tokens = self.model.config.max_position_embeddings
             else:
-                self.max_tokens = 512
- 
+                self.max_tokens = self.options.get("max_new_tokens", 512)
+
             if autoTokenizer:
-                self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_safetensors=True)
+                self.tokenizer = AutoTokenizer.from_pretrained(model_name)
                 self.XPU = False
 
                 if XPU and self.OV == False:
@@ -279,22 +251,9 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
         except Exception as err:
             print("Error:", err, file=sys.stderr)
             return backend_pb2.Result(success=False, message=f"Unexpected {err=}, {type(err)=}")
-        # Implement your logic here for the LoadModel service
-        # Replace this with your desired response
         return backend_pb2.Result(message="Model loaded successfully", success=True)
 
     def Embedding(self, request, context):
-        """
-        A gRPC method that calculates embeddings for a given sentence.
-
-        Args:
-            request: An EmbeddingRequest object that contains the request parameters.
-            context: A grpc.ServicerContext object that provides information about the RPC.
-
-        Returns:
-            An EmbeddingResult object that contains the calculated embeddings.
-        """
-
         set_seed(request.Seed)
         # Tokenize input
         max_length = 512
@@ -307,13 +266,13 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
             print("Calculated embeddings for: " + request.Embeddings, file=sys.stderr)
             embeds = self.model.encode(request.Embeddings)
         else:
-            encoded_input = self.tokenizer(request.Embeddings, padding=True, truncation=True, max_length=max_length, return_tensors="pt")    
+            encoded_input = self.tokenizer(request.Embeddings, padding=True, truncation=True, max_length=max_length, return_tensors="pt")
 
             # Create word embeddings
             if self.CUDA:
                 encoded_input = encoded_input.to("cuda")
 
-            with torch.no_grad():    
+            with torch.no_grad():
                 model_output = self.model(**encoded_input)
 
             # Pool to get sentence embeddings; i.e. generate one 1024 vector for the entire sentence
@@ -321,11 +280,11 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
             embeds = sentence_embeddings[0]
         return backend_pb2.EmbeddingResult(embeddings=embeds)
 
-    async def _predict(self, request, context, streaming=False): 
+    async def _predict(self, request, context, streaming=False):
         set_seed(request.Seed)
         if request.TopP < 0 or request.TopP > 1:
             request.TopP = 1
-        
+
         if request.TopK <= 0:
             request.TopK = 50
 
@@ -338,7 +297,7 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
             request.Temperature == None
 
         prompt = request.Prompt
-        if not request.Prompt and request.UseTokenizerTemplate and request.Messages:    
+        if not request.Prompt and request.UseTokenizerTemplate and request.Messages:
             prompt = self.tokenizer.apply_chat_template(request.Messages, tokenize=False, add_generation_prompt=True)
 
         inputs = self.tokenizer(prompt, return_tensors="pt")
@@ -367,10 +326,10 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
                                         skip_prompt=True,
                                         skip_special_tokens=True)
             config=dict(inputs,
-                        max_new_tokens=max_tokens, 
-                        temperature=request.Temperature, 
+                        max_new_tokens=max_tokens,
+                        temperature=request.Temperature,
                         top_p=request.TopP,
-                        top_k=request.TopK, 
+                        top_k=request.TopK,
                         do_sample=sample,
                         attention_mask=inputs["attention_mask"],
                         eos_token_id=self.tokenizer.eos_token_id,
@@ -391,18 +350,18 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
         else:
             if XPU and self.OV == False:
                 outputs = self.model.generate(inputs["input_ids"],
-                                    max_new_tokens=max_tokens, 
-                                    temperature=request.Temperature, 
+                                    max_new_tokens=max_tokens,
+                                    temperature=request.Temperature,
                                     top_p=request.TopP,
-                                    top_k=request.TopK, 
+                                    top_k=request.TopK,
                                     do_sample=sample,
                                     pad_token=self.tokenizer.eos_token_id)
             else:
                 outputs = self.model.generate(**inputs,
-                        max_new_tokens=max_tokens, 
-                        temperature=request.Temperature, 
+                        max_new_tokens=max_tokens,
+                        temperature=request.Temperature,
                         top_p=request.TopP,
-                        top_k=request.TopK, 
+                        top_k=request.TopK,
                         do_sample=sample,
                         eos_token_id=self.tokenizer.eos_token_id,
                         pad_token_id=self.tokenizer.eos_token_id,
@@ -417,31 +376,11 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
         yield backend_pb2.Reply(message=bytes(generated_text, encoding='utf-8'))
 
     async def Predict(self, request, context):
-        """
-        Generates text based on the given prompt and sampling parameters.
-
-        Args:
-            request: The predict request.
-            context: The gRPC context.
-
-        Returns:
-            backend_pb2.Reply: The predict result.
-        """
         gen = self._predict(request, context, streaming=False)
         res = await gen.__anext__()
         return res
 
     async def PredictStream(self, request, context):
-        """
-        Generates text based on the given prompt and sampling parameters, and streams the results.
-
-        Args:
-            request: The predict stream request.
-            context: The gRPC context.
-
-        Returns:
-            backend_pb2.Result: The predict stream result.
-        """
         iterations = self._predict(request, context, streaming=True)
         try:
             async for iteration in iterations:
@@ -459,18 +398,19 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
             if self.model is None:
                 if model_name == "":
                     return backend_pb2.Result(success=False, message="request.model is required")
-                self.model = MusicgenForConditionalGeneration.from_pretrained(model_name)
+                # Dynamically resolve model class if configured, otherwise default to MusicgenForConditionalGeneration
+                model_type = self.options.get("model_type", "MusicgenForConditionalGeneration")
+                ModelClass = getattr(transformers_module, model_type)
+                self.model = ModelClass.from_pretrained(model_name)
             inputs = None
             if request.text == "":
                 inputs = self.model.get_unconditional_inputs(num_samples=1)
             elif request.HasField('src'):
-                # TODO SECURITY CODE GOES HERE LOL
-                # WHO KNOWS IF THIS WORKS???
                 sample_rate, wsamples = wavfile.read('path_to_your_file.wav')
-                
+
                 if request.HasField('src_divisor'):
                     wsamples = wsamples[: len(wsamples) // request.src_divisor]
-                
+
                 inputs = self.processor(
                     audio=wsamples,
                     sampling_rate=sample_rate,
@@ -484,75 +424,107 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
                     padding=True,
                     return_tensors="pt",
                 )
-            
-            tokens = 256
+
             if request.HasField('duration'):
                 tokens = int(request.duration * 51.2) # 256 tokens = 5 seconds, therefore 51.2 tokens is one second
-            guidance = 3.0
+            guidance = self.options.get("guidance_scale", 3.0)
             if request.HasField('temperature'):
                 guidance = request.temperature
-            dosample = True
+            dosample = self.options.get("do_sample", True)
             if request.HasField('sample'):
                 dosample = request.sample
-            audio_values = self.model.generate(**inputs, do_sample=dosample, guidance_scale=guidance, max_new_tokens=tokens)
-            print("[transformers-musicgen] SoundGeneration generated!", file=sys.stderr)
-            sampling_rate = self.model.config.audio_encoder.sampling_rate
-            wavfile.write(request.dst, rate=sampling_rate, data=audio_values[0, 0].numpy())
-            print("[transformers-musicgen] SoundGeneration saved to", request.dst, file=sys.stderr)
-            print("[transformers-musicgen] SoundGeneration for", file=sys.stderr)
-            print("[transformers-musicgen] SoundGeneration requested tokens", tokens, file=sys.stderr)
+            audio_values = self.model.generate(**inputs, do_sample=dosample, guidance_scale=guidance, max_new_tokens=self.max_tokens)
+            print("[transformers] SoundGeneration generated!", file=sys.stderr)
+
+            # Save audio output
+            if hasattr(self.processor, 'save_audio'):
+                if hasattr(self.processor, 'batch_decode'):
+                    try:
+                        audio_values = self.processor.batch_decode(audio_values)
+                    except Exception:
+                        pass
+                self.processor.save_audio(audio_values, request.dst)
+            else:
+                sampling_rate = self.model.config.audio_encoder.sampling_rate
+                wavfile.write(request.dst, rate=sampling_rate, data=audio_values[0, 0].numpy())
+
+            print("[transformers] SoundGeneration saved to", request.dst, file=sys.stderr)
             print(request, file=sys.stderr)
         except Exception as err:
             return backend_pb2.Result(success=False, message=f"Unexpected {err=}, {type(err)=}")
         return backend_pb2.Result(success=True)
 
-    def OuteTTS(self, request, context):
-        try:
-            print("[OuteTTS] generating TTS", file=sys.stderr)
-            gen_cfg = outetts.GenerationConfig(
-                text="Speech synthesis is the artificial production of human speech.",
-                temperature=0.1,
-                repetition_penalty=1.1,
-                max_length=self.max_tokens,
-                speaker=self.speaker,
-                # voice_characteristics="upbeat enthusiasm, friendliness, clarity, professionalism, and trustworthiness"
-            )
-            output = self.interface.generate(config=gen_cfg)
-            print("[OuteTTS] Generated TTS", file=sys.stderr)
-            output.save(request.dst)
-            print("[OuteTTS] TTS done", file=sys.stderr)
-        except Exception as err:
-            return backend_pb2.Result(success=False, message=f"Unexpected {err=}, {type(err)=}")
-        return backend_pb2.Result(success=True)
-
-# The TTS endpoint is older, and provides fewer features, but exists for compatibility reasons
     def TTS(self, request, context):
-        if self.OuteTTS:
-            return self.OuteTTS(request, context)
-
-        model_name = request.model
         try:
-            if self.processor is None:
-                if model_name == "":
-                    return backend_pb2.Result(success=False, message="request.model is required")
-                self.processor = AutoProcessor.from_pretrained(model_name)
-            if self.model is None:
-                if model_name == "":
-                    return backend_pb2.Result(success=False, message="request.model is required")
-                self.model = MusicgenForConditionalGeneration.from_pretrained(model_name)
-            inputs = self.processor(
-                text=[request.text],
-                padding=True,
-                return_tensors="pt",
-            )
-            tokens = self.max_tokens # No good place to set the "length" in TTS, so use 10s as a sane default
-            audio_values = self.model.generate(**inputs, max_new_tokens=tokens)
-            print("[transformers-musicgen] TTS generated!", file=sys.stderr)
-            sampling_rate = self.model.config.audio_encoder.sampling_rate
-            wavfile.write(request.dst, rate=sampling_rate, data=audio_values[0, 0].numpy())
-            print("[transformers-musicgen] TTS saved to", request.dst, file=sys.stderr)
-            print("[transformers-musicgen] TTS for", file=sys.stderr)
-            print(request, file=sys.stderr)
+            text = request.text
+            print(f"[transformers] TTS generating for text: {text[:100]}...", file=sys.stderr)
+
+            # Build inputs based on processor capabilities
+            if request.voice and os.path.exists(request.voice):
+                # Voice cloning: use chat template with reference audio
+                chat_template = [{
+                    "role": "0",
+                    "content": [
+                        {"type": "text", "text": text},
+                        {"type": "audio", "path": request.voice},
+                    ],
+                }]
+                inputs = self.processor.apply_chat_template(
+                    chat_template, tokenize=True, return_dict=True,
+                ).to(self.model.device, self.model.dtype)
+            elif hasattr(self.processor, 'apply_chat_template'):
+                # Models that use chat template format (VibeVoice, CSM, etc.)
+                chat_template = [{"role": "0", "content": [{"type": "text", "text": text}]}]
+                try:
+                    inputs = self.processor.apply_chat_template(
+                        chat_template, tokenize=True, return_dict=True,
+                    ).to(self.model.device, self.model.dtype)
+                except Exception:
+                    # Fallback if chat template fails (not all processors support it)
+                    inputs = self.processor(text=[text], padding=True, return_tensors="pt")
+                    if self.CUDA:
+                        inputs = inputs.to("cuda")
+            else:
+                # Direct processor call (Musicgen, etc.)
+                inputs = self.processor(text=[text], padding=True, return_tensors="pt")
+                if self.CUDA:
+                    inputs = inputs.to("cuda")
+
+            # Build generation kwargs from self.options
+            gen_kwargs = {**inputs, "max_new_tokens": self.max_tokens}
+            for key in ["guidance_scale", "temperature", "top_p", "top_k", "do_sample"]:
+                if key in self.options:
+                    gen_kwargs[key] = self.options[key]
+
+            # Add noise scheduler if configured (e.g., for VibeVoice)
+            noise_scheduler_type = self.options.get("noise_scheduler", None)
+            if noise_scheduler_type:
+                import diffusers
+                SchedulerClass = getattr(diffusers, noise_scheduler_type)
+                scheduler_kwargs = {}
+                for key in ["beta_schedule", "prediction_type"]:
+                    if key in self.options:
+                        scheduler_kwargs[key] = self.options[key]
+                gen_kwargs["noise_scheduler"] = SchedulerClass(**scheduler_kwargs)
+
+            # Generate audio
+            audio = self.model.generate(**gen_kwargs)
+            print("[transformers] TTS generated!", file=sys.stderr)
+
+            # Save audio output
+            if hasattr(self.processor, 'save_audio'):
+                if hasattr(self.processor, 'batch_decode'):
+                    try:
+                        audio = self.processor.batch_decode(audio)
+                    except Exception:
+                        pass
+                self.processor.save_audio(audio, request.dst)
+            else:
+                sampling_rate = self.model.config.audio_encoder.sampling_rate
+                wavfile.write(request.dst, rate=sampling_rate, data=audio[0, 0].numpy())
+
+            print("[transformers] TTS saved to", request.dst, file=sys.stderr)
+
         except Exception as err:
             return backend_pb2.Result(success=False, message=f"Unexpected {err=}, {type(err)=}")
         return backend_pb2.Result(success=True)
@@ -564,7 +536,9 @@ async def serve(address):
             ('grpc.max_message_length', 50 * 1024 * 1024),  # 50MB
             ('grpc.max_send_message_length', 50 * 1024 * 1024),  # 50MB
             ('grpc.max_receive_message_length', 50 * 1024 * 1024),  # 50MB
-        ])
+        ],
+        interceptors=get_auth_interceptors(aio=True),
+    )
     # Add the servicer to the server
     backend_pb2_grpc.add_BackendServicer_to_server(BackendServicer(), server)
     # Bind the server to the address

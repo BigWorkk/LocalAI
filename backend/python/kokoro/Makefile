@@ -1,19 +1,22 @@
-.DEFAULT_GOAL := install
-
-.PHONY: install
-install:
+.PHONY: kokoro
+kokoro:
 	bash install.sh
-	$(MAKE) protogen
 
-.PHONY: protogen
-protogen: backend_pb2_grpc.py backend_pb2.py
+.PHONY: run
+run: kokoro
+	@echo "Running kokoro..."
+	bash run.sh
+	@echo "kokoro run."
+
+.PHONY: test
+test: kokoro
+	@echo "Testing kokoro..."
+	bash test.sh
+	@echo "kokoro tested."
 
 .PHONY: protogen-clean
 protogen-clean:
 	$(RM) backend_pb2_grpc.py backend_pb2.py
-
-backend_pb2_grpc.py backend_pb2.py:
-	bash protogen.sh
 
 .PHONY: clean
 clean: protogen-clean

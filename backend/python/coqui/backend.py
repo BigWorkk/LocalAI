@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-This is an extra gRPC server of LocalAI for Bark TTS
+This is an extra gRPC server of LocalAI for Coqui TTS
 """
 from concurrent import futures
 import time
@@ -15,6 +15,10 @@ import torch
 from TTS.api import TTS
 
 import grpc
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'common'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'common'))
+from grpc_auth import get_auth_interceptors
+
 
 
 _ONE_DAY_IN_SECONDS = 60 * 60 * 24
@@ -40,7 +44,9 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
         else:
             print("CUDA is not available", file=sys.stderr)
             device = "cpu"
-
+        mps_available = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+        if mps_available:
+            device = "mps"
         if not torch.cuda.is_available() and request.CUDA:
             return backend_pb2.Result(success=False, message="CUDA is not available")
 
@@ -66,7 +72,7 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
 
     def TTS(self, request, context):
         try:
-            # if model is multilangual add language from request or env as fallback
+            # if model is multilingual add language from request or env as fallback
             lang = request.language or COQUI_LANGUAGE
             if lang == "":
                 lang = None
@@ -91,7 +97,9 @@ def serve(address):
             ('grpc.max_message_length', 50 * 1024 * 1024),  # 50MB
             ('grpc.max_send_message_length', 50 * 1024 * 1024),  # 50MB
             ('grpc.max_receive_message_length', 50 * 1024 * 1024),  # 50MB
-        ])
+        ],
+        interceptors=get_auth_interceptors(),
+    )
     backend_pb2_grpc.add_BackendServicer_to_server(BackendServicer(), server)
     server.add_insecure_port(address)
     server.start()

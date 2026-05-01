@@ -1,17 +1,39 @@
 package backend
 
 import (
-	"math/rand"
+	"encoding/json"
+	"fmt"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"strings"
+	"time"
 
 	"github.com/mudler/LocalAI/core/config"
+	"github.com/mudler/LocalAI/core/trace"
 	pb "github.com/mudler/LocalAI/pkg/grpc/proto"
 	"github.com/mudler/LocalAI/pkg/model"
-	"github.com/rs/zerolog/log"
+	"github.com/mudler/xlog"
 )
 
-func ModelOptions(c config.BackendConfig, so *config.ApplicationConfig, opts ...model.Option) []model.Option {
+// recordModelLoadFailure records a backend trace when model loading fails.
+func recordModelLoadFailure(appConfig *config.ApplicationConfig, modelName, backend string, err error, data map[string]any) {
+	if !appConfig.EnableTracing {
+		return
+	}
+	trace.InitBackendTracingIfEnabled(appConfig.TracingMaxItems)
+	trace.RecordBackendTrace(trace.BackendTrace{
+		Timestamp: time.Now(),
+		Type:      trace.BackendTraceModelLoad,
+		ModelName: modelName,
+		Backend:   backend,
+		Summary:   "Model load failed",
+		Error:     err.Error(),
+		Data:      data,
+	})
+}
+
+func ModelOptions(c config.ModelConfig, so *config.ApplicationConfig, opts ...model.Option) []model.Option {
 	name := c.Name
 	if name == "" {
 		name = c.Model
@@ -20,7 +42,6 @@ func ModelOptions(c config.BackendConfig, so *config.ApplicationConfig, opts ...
 	defOpts := []model.Option{
 		model.WithBackendString(c.Backend),
 		model.WithModel(c.Model),
-		model.WithAssetDir(so.AssetsDestination),
 		model.WithContext(so.Context),
 		model.WithModelID(name),
 	}
@@ -37,12 +58,10 @@ func ModelOptions(c config.BackendConfig, so *config.ApplicationConfig, opts ...
 
 	c.Threads = &threads
 
-	grpcOpts := grpcModelOpts(c)
+	grpcOpts := grpcModelOpts(c, so.SystemState.Model.ModelsPath)
 	defOpts = append(defOpts, model.WithLoadGRPCLoadModelOpts(grpcOpts))
 
-	if so.ParallelBackendRequests {
-		defOpts = append(defOpts, model.EnableParallelRequests)
-	}
+	defOpts = append(defOpts, model.EnableParallelRequests)
 
 	if c.GRPC.Attempts != 0 {
 		defOpts = append(defOpts, model.WithGRPCAttempts(c.GRPC.Attempts))
@@ -59,7 +78,7 @@ func ModelOptions(c config.BackendConfig, so *config.ApplicationConfig, opts ...
 	return append(defOpts, opts...)
 }
 
-func getSeed(c config.BackendConfig) int32 {
+func getSeed(c config.ModelConfig) int32 {
 	var seed int32 = config.RAND_SEED
 
 	if c.Seed != nil {
@@ -67,16 +86,22 @@ func getSeed(c config.BackendConfig) int32 {
 	}
 
 	if seed == config.RAND_SEED {
-		seed = rand.Int31()
+		seed = rand.Int32()
 	}
 
 	return seed
 }
 
-func grpcModelOpts(c config.BackendConfig) *pb.ModelOptions {
+func grpcModelOpts(c config.ModelConfig, modelPath string) *pb.ModelOptions {
 	b := 512
 	if c.Batch != 0 {
 		b = c.Batch
+	}
+
+	flashAttention := "auto"
+
+	if c.FlashAttention != nil {
+		flashAttention = *c.FlashAttention
 	}
 
 	f16 := false
@@ -104,6 +129,16 @@ func grpcModelOpts(c config.BackendConfig) *pb.ModelOptions {
 		mmap = *c.MMap
 	}
 
+	// Intel SYCL backend has issues with mmap enabled
+	// See: https://github.com/mudler/LocalAI/issues/9012
+	// Automatically disable mmap for Intel SYCL backends
+	if c.Backend != "" {
+		if strings.Contains(strings.ToLower(c.Backend), "intel") || strings.Contains(strings.ToLower(c.Backend), "sycl") {
+			mmap = false
+			xlog.Info("Auto-disabling mmap for Intel SYCL backend", "backend", c.Backend)
+		}
+	}
+
 	ctxSize := 4096
 	if c.ContextSize != nil {
 		ctxSize = *c.ContextSize
@@ -124,10 +159,22 @@ func grpcModelOpts(c config.BackendConfig) *pb.ModelOptions {
 		triggers = append(triggers, &pb.GrammarTrigger{
 			Word: t.Word,
 		})
-
 	}
 
-	return &pb.ModelOptions{
+	engineArgsJSON := ""
+	if len(c.EngineArgs) > 0 {
+		buf, err := json.Marshal(c.EngineArgs)
+		if err != nil {
+			// ModelConfig.Validate() rejects unmarshalable engine_args at
+			// config load, so reaching here means the validator was bypassed.
+			// Silently dropping user-set options would change runtime behaviour
+			// without warning — fail loud instead.
+			panic(fmt.Sprintf("engine_args marshal failed for model %q: %v (Validate() should have caught this)", c.Model, err))
+		}
+		engineArgsJSON = string(buf)
+	}
+
+	opts := &pb.ModelOptions{
 		CUDA:                 c.CUDA || c.Diffusers.CUDA,
 		SchedulerType:        c.Diffusers.SchedulerType,
 		GrammarTriggers:      triggers,
@@ -143,6 +190,8 @@ func grpcModelOpts(c config.BackendConfig) *pb.ModelOptions {
 		CLIPModel:            c.Diffusers.ClipModel,
 		CLIPSubfolder:        c.Diffusers.ClipSubFolder,
 		Options:              c.Options,
+		Overrides:            c.Overrides,
+		EngineArgs:           engineArgsJSON,
 		CLIPSkip:             int32(c.Diffusers.ClipSkip),
 		ControlNet:           c.Diffusers.ControlNet,
 		ContextSize:          int32(ctxSize),
@@ -165,8 +214,7 @@ func grpcModelOpts(c config.BackendConfig) *pb.ModelOptions {
 		LimitImagePerPrompt: int32(c.LimitMMPerPrompt.LimitImagePerPrompt),
 		LimitVideoPerPrompt: int32(c.LimitMMPerPrompt.LimitVideoPerPrompt),
 		LimitAudioPerPrompt: int32(c.LimitMMPerPrompt.LimitAudioPerPrompt),
-		MMProj:              c.MMProj,
-		FlashAttention:      c.FlashAttention,
+		FlashAttention:      flashAttention,
 		CacheTypeKey:        c.CacheTypeK,
 		CacheTypeValue:      c.CacheTypeV,
 		NoKVOffload:         c.NoKVOffloading,
@@ -193,9 +241,15 @@ func grpcModelOpts(c config.BackendConfig) *pb.ModelOptions {
 		// RWKV
 		Tokenizer: c.Tokenizer,
 	}
+
+	if c.MMProj != "" {
+		opts.MMProj = filepath.Join(modelPath, c.MMProj)
+	}
+
+	return opts
 }
 
-func gRPCPredictOpts(c config.BackendConfig, modelPath string) *pb.PredictOptions {
+func gRPCPredictOpts(c config.ModelConfig, modelPath string) *pb.PredictOptions {
 	promptCachePath := ""
 	if c.PromptCachePath != "" {
 		p := filepath.Join(modelPath, c.PromptCachePath)
@@ -203,15 +257,16 @@ func gRPCPredictOpts(c config.BackendConfig, modelPath string) *pb.PredictOption
 		if err == nil {
 			promptCachePath = p
 		} else {
-			log.Error().Err(err).Str("promptCachePath", promptCachePath).Msg("error creating prompt cache folder")
+			xlog.Error("error creating prompt cache folder", "error", err, "promptCachePath", promptCachePath)
 		}
 	}
 
-	return &pb.PredictOptions{
+	pbOpts := &pb.PredictOptions{
 		Temperature:         float32(*c.Temperature),
 		TopP:                float32(*c.TopP),
 		NDraft:              c.NDraft,
 		TopK:                int32(*c.TopK),
+		MinP:                float32(*c.MinP),
 		Tokens:              int32(*c.Maxtokens),
 		Threads:             int32(*c.Threads),
 		PromptCacheAll:      c.PromptCacheAll,
@@ -244,4 +299,17 @@ func gRPCPredictOpts(c config.BackendConfig, modelPath string) *pb.PredictOption
 		TailFreeSamplingZ:   float32(*c.TFZ),
 		TypicalP:            float32(*c.TypicalP),
 	}
+
+	metadata := map[string]string{}
+	if c.ReasoningConfig.DisableReasoning != nil {
+		if *c.ReasoningConfig.DisableReasoning {
+			metadata["enable_thinking"] = "false"
+		} else {
+			metadata["enable_thinking"] = "true"
+		}
+	}
+	pbOpts.Metadata = metadata
+
+	// Logprobs and TopLogprobs are set by the caller if provided
+	return pbOpts
 }

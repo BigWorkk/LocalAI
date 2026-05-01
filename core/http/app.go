@@ -4,38 +4,44 @@ import (
 	"embed"
 	"errors"
 	"fmt"
+	"io/fs"
+	"mime"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 
-	"github.com/dave-gray101/v2keyauth"
-	"github.com/mudler/LocalAI/pkg/utils"
+	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v4/middleware"
 
+	"github.com/mudler/LocalAI/core/http/auth"
 	"github.com/mudler/LocalAI/core/http/endpoints/localai"
-	"github.com/mudler/LocalAI/core/http/endpoints/openai"
-	"github.com/mudler/LocalAI/core/http/middleware"
+
+	httpMiddleware "github.com/mudler/LocalAI/core/http/middleware"
 	"github.com/mudler/LocalAI/core/http/routes"
 
 	"github.com/mudler/LocalAI/core/application"
 	"github.com/mudler/LocalAI/core/schema"
-	"github.com/mudler/LocalAI/core/services"
+	"github.com/mudler/LocalAI/core/services/finetune"
+	"github.com/mudler/LocalAI/core/services/galleryop"
+	"github.com/mudler/LocalAI/core/services/monitoring"
+	"github.com/mudler/LocalAI/core/services/nodes"
+	"github.com/mudler/LocalAI/core/services/quantization"
 
-	"github.com/gofiber/contrib/fiberzerolog"
-	"github.com/gofiber/fiber/v2"
-	"github.com/gofiber/fiber/v2/middleware/cors"
-	"github.com/gofiber/fiber/v2/middleware/csrf"
-	"github.com/gofiber/fiber/v2/middleware/favicon"
-	"github.com/gofiber/fiber/v2/middleware/filesystem"
-	"github.com/gofiber/fiber/v2/middleware/recover"
-
-	// swagger handler
-	"github.com/rs/zerolog/log"
+	"github.com/mudler/xlog"
 )
 
 // Embed a directory
 //
 //go:embed static/*
 var embedDirStatic embed.FS
+
+// Embed React UI build output
+//
+//go:embed react-ui/dist/*
+var reactUI embed.FS
+
+var quietPaths = []string{"/api/operations", "/api/resources", "/healthz", "/readyz"}
 
 // @title LocalAI API
 // @version 2.0.0
@@ -46,115 +52,185 @@ var embedDirStatic embed.FS
 // @license.name MIT
 // @license.url https://raw.githubusercontent.com/mudler/LocalAI/master/LICENSE
 // @BasePath /
+// @schemes http https
 // @securityDefinitions.apikey BearerAuth
 // @in header
 // @name Authorization
+// @tag.name inference
+// @tag.description Chat completions, text completions, edits, and responses (OpenAI-compatible)
+// @tag.name embeddings
+// @tag.description Vector embeddings (OpenAI-compatible)
+// @tag.name audio
+// @tag.description Text-to-speech, transcription, voice activity detection, sound generation
+// @tag.name images
+// @tag.description Image generation and inpainting
+// @tag.name video
+// @tag.description Video generation from prompts
+// @tag.name detection
+// @tag.description Object detection in images
+// @tag.name tokenize
+// @tag.description Tokenization and token metrics
+// @tag.name models
+// @tag.description Model gallery browsing, installation, deletion, and listing
+// @tag.name backends
+// @tag.description Backend gallery browsing, installation, deletion, and listing
+// @tag.name config
+// @tag.description Model configuration metadata, autocomplete, PATCH updates, VRAM estimation
+// @tag.name monitoring
+// @tag.description Prometheus metrics, backend status, system information
+// @tag.name mcp
+// @tag.description Model Context Protocol — tool-augmented chat with MCP servers
+// @tag.name agent-jobs
+// @tag.description Agent task and job management
+// @tag.name p2p
+// @tag.description Peer-to-peer networking nodes and tokens
+// @tag.name rerank
+// @tag.description Document reranking
+// @tag.name instructions
+// @tag.description API instruction discovery — browse instruction areas and get endpoint guides
 
-func API(application *application.Application) (*fiber.App, error) {
+func API(application *application.Application) (*echo.Echo, error) {
+	e := echo.New()
 
-	fiberCfg := fiber.Config{
-		Views:     renderEngine(),
-		BodyLimit: application.ApplicationConfig().UploadLimitMB * 1024 * 1024, // this is the default limit of 4MB
-		// We disable the Fiber startup message as it does not conform to structured logging.
-		// We register a startup log line with connection information in the OnListen hook to keep things user friendly though
-		DisableStartupMessage: true,
-		// Override default error handler
+	// Set body limit
+	if application.ApplicationConfig().UploadLimitMB > 0 {
+		e.Use(middleware.BodyLimit(fmt.Sprintf("%dM", application.ApplicationConfig().UploadLimitMB)))
 	}
 
-	if !application.ApplicationConfig().OpaqueErrors {
-		// Normally, return errors as JSON responses
-		fiberCfg.ErrorHandler = func(ctx *fiber.Ctx, err error) error {
-			// Status code defaults to 500
-			code := fiber.StatusInternalServerError
+	// SPA fallback handler, set later when React UI is available
+	var spaFallback func(echo.Context) error
 
-			// Retrieve the custom status code if it's a *fiber.Error
-			var e *fiber.Error
-			if errors.As(err, &e) {
-				code = e.Code
+	// Set error handler
+	if !application.ApplicationConfig().OpaqueErrors {
+		e.HTTPErrorHandler = func(err error, c echo.Context) {
+			code := http.StatusInternalServerError
+			var he *echo.HTTPError
+			if errors.As(err, &he) {
+				code = he.Code
+			}
+
+			// Handle 404 errors: serve React SPA for HTML requests, JSON otherwise
+			if code == http.StatusNotFound {
+				if spaFallback != nil {
+					accept := c.Request().Header.Get("Accept")
+					contentType := c.Request().Header.Get("Content-Type")
+					if strings.Contains(accept, "text/html") && !strings.Contains(contentType, "application/json") {
+						spaFallback(c)
+						return
+					}
+				}
+				notFoundHandler(c)
+				return
 			}
 
 			// Send custom error page
-			return ctx.Status(code).JSON(
-				schema.ErrorResponse{
-					Error: &schema.APIError{Message: err.Error(), Code: code},
-				},
-			)
+			c.JSON(code, schema.ErrorResponse{
+				Error: &schema.APIError{Message: err.Error(), Code: code},
+			})
 		}
 	} else {
-		// If OpaqueErrors are required, replace everything with a blank 500.
-		fiberCfg.ErrorHandler = func(ctx *fiber.Ctx, _ error) error {
-			return ctx.Status(500).SendString("")
+		e.HTTPErrorHandler = func(err error, c echo.Context) {
+			code := http.StatusInternalServerError
+			var he *echo.HTTPError
+			if errors.As(err, &he) {
+				code = he.Code
+			}
+			c.NoContent(code)
 		}
 	}
 
-	router := fiber.New(fiberCfg)
+	// Set renderer
+	e.Renderer = renderEngine()
 
-	router.Use(middleware.StripPathPrefix())
+	// Hide banner
+	e.HideBanner = true
+	e.HidePort = true
+
+	// Middleware - StripPathPrefix must be registered early as it uses Rewrite which runs before routing
+	e.Pre(httpMiddleware.StripPathPrefix())
+
+	e.Pre(middleware.RemoveTrailingSlash())
 
 	if application.ApplicationConfig().MachineTag != "" {
-		router.Use(func(c *fiber.Ctx) error {
-			c.Response().Header.Set("Machine-Tag", application.ApplicationConfig().MachineTag)
-
-			return c.Next()
+		e.Use(func(next echo.HandlerFunc) echo.HandlerFunc {
+			return func(c echo.Context) error {
+				c.Response().Header().Set("Machine-Tag", application.ApplicationConfig().MachineTag)
+				return next(c)
+			}
 		})
 	}
 
-	router.Hooks().OnListen(func(listenData fiber.ListenData) error {
-		scheme := "http"
-		if listenData.TLS {
-			scheme = "https"
+	// Custom logger middleware using xlog
+	e.Use(func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			req := c.Request()
+			res := c.Response()
+			err := next(c)
+
+			// Fix for #7989: Reduce log verbosity of Web UI polling, resources API, and health checks
+			// These paths are logged at DEBUG level (hidden by default) instead of INFO.
+			isQuietPath := false
+			for _, path := range quietPaths {
+				if req.URL.Path == path {
+					isQuietPath = true
+					break
+				}
+			}
+
+			if isQuietPath && res.Status == 200 {
+				xlog.Debug("HTTP request", "method", req.Method, "path", req.URL.Path, "status", res.Status)
+			} else {
+				xlog.Info("HTTP request", "method", req.Method, "path", req.URL.Path, "status", res.Status)
+			}
+			return err
 		}
-		log.Info().Str("endpoint", scheme+"://"+listenData.Host+":"+listenData.Port).Msg("LocalAI API is listening! Please connect to the endpoint for API documentation.")
-		return nil
 	})
 
-	// Have Fiber use zerolog like the rest of the application rather than it's built-in logger
-	logger := log.Logger
-	router.Use(fiberzerolog.New(fiberzerolog.Config{
-		Logger: &logger,
-	}))
-
-	// Default middleware config
-
+	// Recover middleware
 	if !application.ApplicationConfig().Debug {
-		router.Use(recover.New())
+		e.Use(middleware.Recover())
 	}
 
+	// Metrics middleware
 	if !application.ApplicationConfig().DisableMetrics {
-		metricsService, err := services.NewLocalAIMetricsService()
+		metricsService, err := monitoring.NewLocalAIMetricsService()
 		if err != nil {
 			return nil, err
 		}
 
 		if metricsService != nil {
-			router.Use(localai.LocalAIMetricsAPIMiddleware(metricsService))
-			router.Hooks().OnShutdown(func() error {
-				return metricsService.Shutdown()
+			e.Use(localai.LocalAIMetricsAPIMiddleware(metricsService))
+			e.Server.RegisterOnShutdown(func() {
+				metricsService.Shutdown()
 			})
 		}
 	}
+
 	// Health Checks should always be exempt from auth, so register these first
-	routes.HealthRoutes(router)
+	routes.HealthRoutes(e)
 
-	kaConfig, err := middleware.GetKeyAuthConfig(application.ApplicationConfig())
-	if err != nil || kaConfig == nil {
-		return nil, fmt.Errorf("failed to create key auth config: %w", err)
+	// Build auth middleware: use the new auth.Middleware when auth is enabled or
+	// as a unified replacement for the legacy key-auth middleware.
+	authMiddleware := auth.Middleware(application.AuthDB(), application.ApplicationConfig())
+
+	// Favicon handler
+	e.GET("/favicon.svg", func(c echo.Context) error {
+		data, err := embedDirStatic.ReadFile("static/favicon.svg")
+		if err != nil {
+			return c.NoContent(http.StatusNotFound)
+		}
+		c.Response().Header().Set("Content-Type", "image/svg+xml")
+		return c.Blob(http.StatusOK, "image/svg+xml", data)
+	})
+
+	// Static files - use fs.Sub to create a filesystem rooted at "static"
+	staticFS, err := fs.Sub(embedDirStatic, "static")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create static filesystem: %w", err)
 	}
+	e.StaticFS("/static", staticFS)
 
-	httpFS := http.FS(embedDirStatic)
-
-	router.Use(favicon.New(favicon.Config{
-		URL:        "/favicon.svg",
-		FileSystem: httpFS,
-		File:       "static/favicon.svg",
-	}))
-
-	router.Use("/static", filesystem.New(filesystem.Config{
-		Root:       httpFS,
-		PathPrefix: "static",
-		Browse:     true,
-	}))
-
+	// Generated content directories
 	if application.ApplicationConfig().GeneratedContentDir != "" {
 		os.MkdirAll(application.ApplicationConfig().GeneratedContentDir, 0750)
 		audioPath := filepath.Join(application.ApplicationConfig().GeneratedContentDir, "audio")
@@ -165,51 +241,240 @@ func API(application *application.Application) (*fiber.App, error) {
 		os.MkdirAll(imagePath, 0750)
 		os.MkdirAll(videoPath, 0750)
 
-		router.Static("/generated-audio", audioPath)
-		router.Static("/generated-images", imagePath)
-		router.Static("/generated-videos", videoPath)
+		e.Static("/generated-audio", audioPath)
+		e.Static("/generated-images", imagePath)
+		e.Static("/generated-videos", videoPath)
 	}
 
-	// Auth is applied to _all_ endpoints. No exceptions. Filtering out endpoints to bypass is the role of the Filter property of the KeyAuth Configuration
-	router.Use(v2keyauth.New(*kaConfig))
+	// Initialize usage recording when auth DB is available
+	if application.AuthDB() != nil {
+		httpMiddleware.InitUsageRecorder(application.AuthDB())
+	}
 
+	// Auth is applied to _all_ endpoints. Filtering out endpoints to bypass is
+	// the role of the exempt-path logic inside the middleware.
+	e.Use(authMiddleware)
+
+	// Feature and model access control (after auth middleware, before routes)
+	if application.AuthDB() != nil {
+		e.Use(auth.RequireRouteFeature(application.AuthDB()))
+		e.Use(auth.RequireModelAccess(application.AuthDB()))
+		e.Use(auth.RequireQuota(application.AuthDB()))
+	}
+
+	// CORS middleware
 	if application.ApplicationConfig().CORS {
-		var c func(ctx *fiber.Ctx) error
-		if application.ApplicationConfig().CORSAllowOrigins == "" {
-			c = cors.New()
-		} else {
-			c = cors.New(cors.Config{AllowOrigins: application.ApplicationConfig().CORSAllowOrigins})
+		corsConfig := middleware.CORSConfig{}
+		if application.ApplicationConfig().CORSAllowOrigins != "" {
+			corsConfig.AllowOrigins = strings.Split(application.ApplicationConfig().CORSAllowOrigins, ",")
 		}
-
-		router.Use(c)
+		e.Use(middleware.CORSWithConfig(corsConfig))
+	} else {
+		e.Use(middleware.CORS())
 	}
 
-	if application.ApplicationConfig().CSRF {
-		log.Debug().Msg("Enabling CSRF middleware. Tokens are now required for state-modifying requests")
-		router.Use(csrf.New())
+	// CSRF middleware (enabled by default, disable with LOCALAI_DISABLE_CSRF=true)
+	//
+	// Protection relies on Echo's Sec-Fetch-Site header check (supported by all
+	// modern browsers). The legacy cookie+token approach is removed because
+	// Echo's Sec-Fetch-Site short-circuit never sets the cookie, so the frontend
+	// could never read a token to send back.
+	if !application.ApplicationConfig().DisableCSRF {
+		xlog.Debug("Enabling CSRF middleware (Sec-Fetch-Site mode)")
+		e.Use(middleware.CSRFWithConfig(middleware.CSRFConfig{
+			Skipper: func(c echo.Context) bool {
+				// Skip CSRF for API clients using auth headers (may be cross-origin)
+				if c.Request().Header.Get("Authorization") != "" {
+					return true
+				}
+				if c.Request().Header.Get("x-api-key") != "" || c.Request().Header.Get("xi-api-key") != "" {
+					return true
+				}
+				// Skip when Sec-Fetch-Site header is absent (older browsers, reverse
+				// proxies that strip the header). The SameSite=Lax cookie attribute
+				// provides baseline CSRF protection for these clients.
+				if c.Request().Header.Get("Sec-Fetch-Site") == "" {
+					return true
+				}
+				return false
+			},
+			// Allow same-site requests (subdomains / different ports) in addition
+			// to same-origin which Echo already permits by default.
+			AllowSecFetchSiteFunc: func(c echo.Context) (bool, error) {
+				secFetchSite := c.Request().Header.Get("Sec-Fetch-Site")
+				if secFetchSite == "same-site" {
+					return true, nil
+				}
+				// cross-site: block
+				return false, nil
+			},
+		}))
 	}
 
-	// Load config jsons
-	utils.LoadConfig(application.ApplicationConfig().UploadDir, openai.UploadedFilesFile, &openai.UploadedFiles)
-	utils.LoadConfig(application.ApplicationConfig().ConfigsDir, openai.AssistantsConfigFile, &openai.Assistants)
-	utils.LoadConfig(application.ApplicationConfig().ConfigsDir, openai.AssistantsFileConfigFile, &openai.AssistantFiles)
+	// Admin middleware: enforces admin role when auth is enabled, no-op otherwise
+	var adminMiddleware echo.MiddlewareFunc
+	if application.AuthDB() != nil {
+		adminMiddleware = auth.RequireAdmin()
+	} else {
+		adminMiddleware = auth.NoopMiddleware()
+	}
 
-	galleryService := services.NewGalleryService(application.ApplicationConfig())
-	galleryService.Start(application.ApplicationConfig().Context, application.BackendLoader())
+	// Feature middlewares: per-feature access control
+	agentsMw := auth.RequireFeature(application.AuthDB(), auth.FeatureAgents)
+	skillsMw := auth.RequireFeature(application.AuthDB(), auth.FeatureSkills)
+	collectionsMw := auth.RequireFeature(application.AuthDB(), auth.FeatureCollections)
+	mcpJobsMw := auth.RequireFeature(application.AuthDB(), auth.FeatureMCPJobs)
 
-	requestExtractor := middleware.NewRequestExtractor(application.BackendLoader(), application.ModelLoader(), application.ApplicationConfig())
+	requestExtractor := httpMiddleware.NewRequestExtractor(application.ModelConfigLoader(), application.ModelLoader(), application.ApplicationConfig())
 
-	routes.RegisterElevenLabsRoutes(router, requestExtractor, application.BackendLoader(), application.ModelLoader(), application.ApplicationConfig())
-	routes.RegisterLocalAIRoutes(router, requestExtractor, application.BackendLoader(), application.ModelLoader(), application.ApplicationConfig(), galleryService)
-	routes.RegisterOpenAIRoutes(router, requestExtractor, application)
+	// Register auth routes (login, callback, API keys, user management)
+	routes.RegisterAuthRoutes(e, application)
+
+	routes.RegisterElevenLabsRoutes(e, requestExtractor, application.ModelConfigLoader(), application.ModelLoader(), application.ApplicationConfig())
+
+	// Create opcache for tracking UI operations (used by both UI and LocalAI routes)
+	var opcache *galleryop.OpCache
 	if !application.ApplicationConfig().DisableWebUI {
-		routes.RegisterUIRoutes(router, application.BackendLoader(), application.ModelLoader(), application.ApplicationConfig(), galleryService)
+		opcache = galleryop.NewOpCache(application.GalleryService())
 	}
-	routes.RegisterJINARoutes(router, requestExtractor, application.BackendLoader(), application.ModelLoader(), application.ApplicationConfig())
 
-	// Define a custom 404 handler
-	// Note: keep this at the bottom!
-	router.Use(notFoundHandler)
+	mcpMw := auth.RequireFeature(application.AuthDB(), auth.FeatureMCP)
+	routes.RegisterLocalAIRoutes(e, requestExtractor, application.ModelConfigLoader(), application.ModelLoader(), application.ApplicationConfig(), application.GalleryService(), opcache, application.TemplatesEvaluator(), application, adminMiddleware, mcpJobsMw, mcpMw)
+	routes.RegisterAgentPoolRoutes(e, application, agentsMw, skillsMw, collectionsMw)
+	// Fine-tuning routes
+	fineTuningMw := auth.RequireFeature(application.AuthDB(), auth.FeatureFineTuning)
+	ftService := finetune.NewFineTuneService(
+		application.ApplicationConfig(),
+		application.ModelLoader(),
+		application.ModelConfigLoader(),
+	)
+	if d := application.Distributed(); d != nil {
+		ftService.SetNATSClient(d.Nats)
+		if d.DistStores != nil && d.DistStores.FineTune != nil {
+			ftService.SetFineTuneStore(d.DistStores.FineTune)
+		}
+	}
+	routes.RegisterFineTuningRoutes(e, ftService, application.ApplicationConfig(), fineTuningMw)
 
-	return router, nil
+	// Quantization routes
+	quantizationMw := auth.RequireFeature(application.AuthDB(), auth.FeatureQuantization)
+	qService := quantization.NewQuantizationService(
+		application.ApplicationConfig(),
+		application.ModelLoader(),
+		application.ModelConfigLoader(),
+	)
+	routes.RegisterQuantizationRoutes(e, qService, application.ApplicationConfig(), quantizationMw)
+
+	// Node management routes (distributed mode)
+	distCfg := application.ApplicationConfig().Distributed
+	var registry *nodes.NodeRegistry
+	var remoteUnloader nodes.NodeCommandSender
+	if d := application.Distributed(); d != nil {
+		registry = d.Registry
+		if d.Router != nil {
+			remoteUnloader = d.Router.Unloader()
+		}
+	}
+	routes.RegisterNodeSelfServiceRoutes(e, registry, distCfg.RegistrationToken, distCfg.AutoApproveNodes, application.AuthDB(), application.ApplicationConfig().Auth.APIKeyHMACSecret)
+	routes.RegisterNodeAdminRoutes(e, registry, remoteUnloader, adminMiddleware, application.AuthDB(), application.ApplicationConfig().Auth.APIKeyHMACSecret, application.ApplicationConfig().Distributed.RegistrationToken)
+
+	// Distributed SSE routes (job progress + agent events via NATS)
+	if d := application.Distributed(); d != nil {
+		if d.Dispatcher != nil {
+			e.GET("/api/agent/jobs/:id/progress", d.Dispatcher.SSEHandler(), mcpJobsMw)
+		}
+		if d.AgentBridge != nil {
+			e.GET("/api/agents/:name/sse/distributed", d.AgentBridge.SSEHandler(), agentsMw)
+		}
+	}
+
+	routes.RegisterOpenAIRoutes(e, requestExtractor, application)
+	routes.RegisterAnthropicRoutes(e, requestExtractor, application)
+	routes.RegisterOpenResponsesRoutes(e, requestExtractor, application)
+	routes.RegisterOllamaRoutes(e, requestExtractor, application)
+	if application.ApplicationConfig().OllamaAPIRootEndpoint {
+		routes.RegisterOllamaRootEndpoint(e)
+	}
+	if !application.ApplicationConfig().DisableWebUI {
+		routes.RegisterUIAPIRoutes(e, application.ModelConfigLoader(), application.ModelLoader(), application.ApplicationConfig(), application.GalleryService(), opcache, application, adminMiddleware)
+		routes.RegisterUIRoutes(e, application.ModelConfigLoader(), application.ApplicationConfig(), application.GalleryService(), adminMiddleware)
+
+		// Serve React SPA from / with SPA fallback via 404 handler
+		reactFS, fsErr := fs.Sub(reactUI, "react-ui/dist")
+		if fsErr != nil {
+			xlog.Warn("React UI not available (build with 'make core/http/react-ui/dist')", "error", fsErr)
+		} else {
+			serveIndex := func(c echo.Context) error {
+				indexHTML, err := reactUI.ReadFile("react-ui/dist/index.html")
+				if err != nil {
+					return c.String(http.StatusNotFound, "React UI not built")
+				}
+				// Inject <base href> for reverse-proxy support
+				baseURL := httpMiddleware.BaseURL(c)
+				if baseURL != "" {
+					baseTag := `<base href="` + baseURL + `" />`
+					indexHTML = []byte(strings.Replace(string(indexHTML), "<head>", "<head>\n  "+baseTag, 1))
+				}
+				return c.HTMLBlob(http.StatusOK, indexHTML)
+			}
+
+			// Enable SPA fallback in the 404 handler for client-side routing
+			spaFallback = serveIndex
+
+			// Serve React SPA at /app
+			e.GET("/app", serveIndex)
+			e.GET("/app/*", serveIndex)
+
+			// prefixRedirect performs a redirect that preserves X-Forwarded-Prefix for reverse-proxy support.
+			prefixRedirect := func(c echo.Context, target string) error {
+				if prefix := c.Request().Header.Get("X-Forwarded-Prefix"); prefix != "" {
+					target = strings.TrimSuffix(prefix, "/") + target
+				}
+				return c.Redirect(http.StatusMovedPermanently, target)
+			}
+
+			// Redirect / to /app
+			e.GET("/", func(c echo.Context) error {
+				return prefixRedirect(c, "/app")
+			})
+
+			// Backward compatibility: redirect /browse/* to /app/*
+			e.GET("/browse", func(c echo.Context) error {
+				return prefixRedirect(c, "/app")
+			})
+			e.GET("/browse/*", func(c echo.Context) error {
+				p := c.Param("*")
+				return prefixRedirect(c, "/app/"+p)
+			})
+
+			// Serve React static assets (JS, CSS, etc.)
+			serveReactAsset := func(c echo.Context) error {
+				p := "assets/" + c.Param("*")
+				f, err := reactFS.Open(p)
+				if err == nil {
+					defer f.Close()
+					stat, statErr := f.Stat()
+					if statErr == nil && !stat.IsDir() {
+						contentType := mime.TypeByExtension(filepath.Ext(p))
+						if contentType == "" {
+							contentType = echo.MIMEOctetStream
+						}
+						return c.Stream(http.StatusOK, contentType, f)
+					}
+				}
+				return echo.NewHTTPError(http.StatusNotFound)
+			}
+			e.GET("/assets/*", serveReactAsset)
+		}
+	}
+	routes.RegisterJINARoutes(e, requestExtractor, application.ModelConfigLoader(), application.ModelLoader(), application.ApplicationConfig())
+
+	// Note: 404 handling is done via HTTPErrorHandler above, no need for catch-all route
+
+	// Log startup message
+	e.Server.RegisterOnShutdown(func() {
+		xlog.Info("LocalAI API server shutting down")
+	})
+
+	return e, nil
 }

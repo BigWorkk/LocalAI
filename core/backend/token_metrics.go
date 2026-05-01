@@ -13,14 +13,14 @@ func TokenMetrics(
 	modelFile string,
 	loader *model.ModelLoader,
 	appConfig *config.ApplicationConfig,
-	backendConfig config.BackendConfig) (*proto.MetricsResponse, error) {
+	modelConfig config.ModelConfig) (*proto.MetricsResponse, error) {
 
-	opts := ModelOptions(backendConfig, appConfig, model.WithModel(modelFile))
+	opts := ModelOptions(modelConfig, appConfig, model.WithModel(modelFile))
 	model, err := loader.Load(opts...)
 	if err != nil {
+		recordModelLoadFailure(appConfig, modelConfig.Name, modelConfig.Backend, err, nil)
 		return nil, err
 	}
-	defer loader.Close()
 
 	if model == nil {
 		return nil, fmt.Errorf("could not loadmodel model")

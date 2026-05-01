@@ -2,6 +2,7 @@ package grpc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -12,10 +13,25 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
+const maxGRPCMessageSize = 50 * 1024 * 1024 // 50MB
+
+// bearerToken implements credentials.PerRPCCredentials to inject a bearer token
+// into every gRPC call.
+type bearerToken struct {
+	token string
+}
+
+func (b bearerToken) GetRequestMetadata(ctx context.Context, uri ...string) (map[string]string, error) {
+	return map[string]string{"authorization": "Bearer " + b.token}, nil
+}
+
+func (b bearerToken) RequireTransportSecurity() bool { return false }
+
 type Client struct {
 	address  string
 	busy     bool
 	parallel bool
+	token    string
 	sync.Mutex
 	opMutex sync.Mutex
 	wd      WatchDog
@@ -50,6 +66,22 @@ func (c *Client) wdUnMark() {
 	}
 }
 
+// dial creates a gRPC client connection with common options.
+// If c.token is set, bearer token credentials are included.
+func (c *Client) dial() (*grpc.ClientConn, error) {
+	opts := []grpc.DialOption{
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(
+			grpc.MaxCallRecvMsgSize(maxGRPCMessageSize),
+			grpc.MaxCallSendMsgSize(maxGRPCMessageSize),
+		),
+	}
+	if c.token != "" {
+		opts = append(opts, grpc.WithPerRPCCredentials(bearerToken{token: c.token}))
+	}
+	return grpc.NewClient(c.address, opts...)
+}
+
 func (c *Client) HealthCheck(ctx context.Context) (bool, error) {
 	if !c.parallel {
 		c.opMutex.Lock()
@@ -57,11 +89,7 @@ func (c *Client) HealthCheck(ctx context.Context) (bool, error) {
 	}
 	c.setBusy(true)
 	defer c.setBusy(false)
-	conn, err := grpc.Dial(c.address, grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(
-			grpc.MaxCallRecvMsgSize(50*1024*1024), // 50MB
-			grpc.MaxCallSendMsgSize(50*1024*1024), // 50MB
-		))
+	conn, err := c.dial()
 	if err != nil {
 		return false, err
 	}
@@ -93,11 +121,7 @@ func (c *Client) Embeddings(ctx context.Context, in *pb.PredictOptions, opts ...
 	defer c.setBusy(false)
 	c.wdMark()
 	defer c.wdUnMark()
-	conn, err := grpc.Dial(c.address, grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(
-			grpc.MaxCallRecvMsgSize(50*1024*1024), // 50MB
-			grpc.MaxCallSendMsgSize(50*1024*1024), // 50MB
-		))
+	conn, err := c.dial()
 	if err != nil {
 		return nil, err
 	}
@@ -116,11 +140,7 @@ func (c *Client) Predict(ctx context.Context, in *pb.PredictOptions, opts ...grp
 	defer c.setBusy(false)
 	c.wdMark()
 	defer c.wdUnMark()
-	conn, err := grpc.Dial(c.address, grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(
-			grpc.MaxCallRecvMsgSize(50*1024*1024), // 50MB
-			grpc.MaxCallSendMsgSize(50*1024*1024), // 50MB
-		))
+	conn, err := c.dial()
 	if err != nil {
 		return nil, err
 	}
@@ -139,11 +159,7 @@ func (c *Client) LoadModel(ctx context.Context, in *pb.ModelOptions, opts ...grp
 	defer c.setBusy(false)
 	c.wdMark()
 	defer c.wdUnMark()
-	conn, err := grpc.Dial(c.address, grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(
-			grpc.MaxCallRecvMsgSize(50*1024*1024), // 50MB
-			grpc.MaxCallSendMsgSize(50*1024*1024), // 50MB
-		))
+	conn, err := c.dial()
 	if err != nil {
 		return nil, err
 	}
@@ -161,11 +177,7 @@ func (c *Client) PredictStream(ctx context.Context, in *pb.PredictOptions, f fun
 	defer c.setBusy(false)
 	c.wdMark()
 	defer c.wdUnMark()
-	conn, err := grpc.Dial(c.address, grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(
-			grpc.MaxCallRecvMsgSize(50*1024*1024), // 50MB
-			grpc.MaxCallSendMsgSize(50*1024*1024), // 50MB
-		))
+	conn, err := c.dial()
 	if err != nil {
 		return err
 	}
@@ -178,11 +190,22 @@ func (c *Client) PredictStream(ctx context.Context, in *pb.PredictOptions, f fun
 	}
 
 	for {
+		// Check if context is cancelled before receiving
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
 		reply, err := stream.Recv()
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
+			// Check if error is due to context cancellation
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			fmt.Println("Error", err)
 
 			return err
@@ -202,11 +225,7 @@ func (c *Client) GenerateImage(ctx context.Context, in *pb.GenerateImageRequest,
 	defer c.setBusy(false)
 	c.wdMark()
 	defer c.wdUnMark()
-	conn, err := grpc.Dial(c.address, grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(
-			grpc.MaxCallRecvMsgSize(50*1024*1024), // 50MB
-			grpc.MaxCallSendMsgSize(50*1024*1024), // 50MB
-		))
+	conn, err := c.dial()
 	if err != nil {
 		return nil, err
 	}
@@ -224,11 +243,7 @@ func (c *Client) GenerateVideo(ctx context.Context, in *pb.GenerateVideoRequest,
 	defer c.setBusy(false)
 	c.wdMark()
 	defer c.wdUnMark()
-	conn, err := grpc.Dial(c.address, grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(
-			grpc.MaxCallRecvMsgSize(50*1024*1024), // 50MB
-			grpc.MaxCallSendMsgSize(50*1024*1024), // 50MB
-		))
+	conn, err := c.dial()
 	if err != nil {
 		return nil, err
 	}
@@ -246,17 +261,59 @@ func (c *Client) TTS(ctx context.Context, in *pb.TTSRequest, opts ...grpc.CallOp
 	defer c.setBusy(false)
 	c.wdMark()
 	defer c.wdUnMark()
-	conn, err := grpc.Dial(c.address, grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(
-			grpc.MaxCallRecvMsgSize(50*1024*1024), // 50MB
-			grpc.MaxCallSendMsgSize(50*1024*1024), // 50MB
-		))
+	conn, err := c.dial()
 	if err != nil {
 		return nil, err
 	}
 	defer conn.Close()
 	client := pb.NewBackendClient(conn)
 	return client.TTS(ctx, in, opts...)
+}
+
+func (c *Client) TTSStream(ctx context.Context, in *pb.TTSRequest, f func(reply *pb.Reply), opts ...grpc.CallOption) error {
+	if !c.parallel {
+		c.opMutex.Lock()
+		defer c.opMutex.Unlock()
+	}
+	c.setBusy(true)
+	defer c.setBusy(false)
+	c.wdMark()
+	defer c.wdUnMark()
+	conn, err := c.dial()
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	client := pb.NewBackendClient(conn)
+
+	stream, err := client.TTSStream(ctx, in, opts...)
+	if err != nil {
+		return err
+	}
+
+	for {
+		// Check if context is cancelled before receiving
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		reply, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			// Check if error is due to context cancellation
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return err
+		}
+		f(reply)
+	}
+
+	return nil
 }
 
 func (c *Client) SoundGeneration(ctx context.Context, in *pb.SoundGenerationRequest, opts ...grpc.CallOption) (*pb.Result, error) {
@@ -268,11 +325,7 @@ func (c *Client) SoundGeneration(ctx context.Context, in *pb.SoundGenerationRequ
 	defer c.setBusy(false)
 	c.wdMark()
 	defer c.wdUnMark()
-	conn, err := grpc.Dial(c.address, grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(
-			grpc.MaxCallRecvMsgSize(50*1024*1024), // 50MB
-			grpc.MaxCallSendMsgSize(50*1024*1024), // 50MB
-		))
+	conn, err := c.dial()
 	if err != nil {
 		return nil, err
 	}
@@ -290,17 +343,57 @@ func (c *Client) AudioTranscription(ctx context.Context, in *pb.TranscriptReques
 	defer c.setBusy(false)
 	c.wdMark()
 	defer c.wdUnMark()
-	conn, err := grpc.Dial(c.address, grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(
-			grpc.MaxCallRecvMsgSize(50*1024*1024), // 50MB
-			grpc.MaxCallSendMsgSize(50*1024*1024), // 50MB
-		))
+	conn, err := c.dial()
 	if err != nil {
 		return nil, err
 	}
 	defer conn.Close()
 	client := pb.NewBackendClient(conn)
 	return client.AudioTranscription(ctx, in, opts...)
+}
+
+func (c *Client) AudioTranscriptionStream(ctx context.Context, in *pb.TranscriptRequest, f func(chunk *pb.TranscriptStreamResponse), opts ...grpc.CallOption) error {
+	if !c.parallel {
+		c.opMutex.Lock()
+		defer c.opMutex.Unlock()
+	}
+	c.setBusy(true)
+	defer c.setBusy(false)
+	c.wdMark()
+	defer c.wdUnMark()
+	conn, err := c.dial()
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	client := pb.NewBackendClient(conn)
+
+	stream, err := client.AudioTranscriptionStream(ctx, in, opts...)
+	if err != nil {
+		return err
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		chunk, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return err
+		}
+		f(chunk)
+	}
+
+	return nil
 }
 
 func (c *Client) TokenizeString(ctx context.Context, in *pb.PredictOptions, opts ...grpc.CallOption) (*pb.TokenizationResponse, error) {
@@ -312,11 +405,7 @@ func (c *Client) TokenizeString(ctx context.Context, in *pb.PredictOptions, opts
 	defer c.setBusy(false)
 	c.wdMark()
 	defer c.wdUnMark()
-	conn, err := grpc.Dial(c.address, grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(
-			grpc.MaxCallRecvMsgSize(50*1024*1024), // 50MB
-			grpc.MaxCallSendMsgSize(50*1024*1024), // 50MB
-		))
+	conn, err := c.dial()
 	if err != nil {
 		return nil, err
 	}
@@ -338,11 +427,7 @@ func (c *Client) Status(ctx context.Context) (*pb.StatusResponse, error) {
 	}
 	c.setBusy(true)
 	defer c.setBusy(false)
-	conn, err := grpc.Dial(c.address, grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(
-			grpc.MaxCallRecvMsgSize(50*1024*1024), // 50MB
-			grpc.MaxCallSendMsgSize(50*1024*1024), // 50MB
-		))
+	conn, err := c.dial()
 	if err != nil {
 		return nil, err
 	}
@@ -360,11 +445,7 @@ func (c *Client) StoresSet(ctx context.Context, in *pb.StoresSetOptions, opts ..
 	defer c.setBusy(false)
 	c.wdMark()
 	defer c.wdUnMark()
-	conn, err := grpc.Dial(c.address, grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(
-			grpc.MaxCallRecvMsgSize(50*1024*1024), // 50MB
-			grpc.MaxCallSendMsgSize(50*1024*1024), // 50MB
-		))
+	conn, err := c.dial()
 	if err != nil {
 		return nil, err
 	}
@@ -382,11 +463,7 @@ func (c *Client) StoresDelete(ctx context.Context, in *pb.StoresDeleteOptions, o
 	defer c.wdUnMark()
 	c.setBusy(true)
 	defer c.setBusy(false)
-	conn, err := grpc.Dial(c.address, grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(
-			grpc.MaxCallRecvMsgSize(50*1024*1024), // 50MB
-			grpc.MaxCallSendMsgSize(50*1024*1024), // 50MB
-		))
+	conn, err := c.dial()
 	if err != nil {
 		return nil, err
 	}
@@ -404,11 +481,7 @@ func (c *Client) StoresGet(ctx context.Context, in *pb.StoresGetOptions, opts ..
 	defer c.setBusy(false)
 	c.wdMark()
 	defer c.wdUnMark()
-	conn, err := grpc.Dial(c.address, grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(
-			grpc.MaxCallRecvMsgSize(50*1024*1024), // 50MB
-			grpc.MaxCallSendMsgSize(50*1024*1024), // 50MB
-		))
+	conn, err := c.dial()
 	if err != nil {
 		return nil, err
 	}
@@ -426,11 +499,7 @@ func (c *Client) StoresFind(ctx context.Context, in *pb.StoresFindOptions, opts 
 	defer c.setBusy(false)
 	c.wdMark()
 	defer c.wdUnMark()
-	conn, err := grpc.Dial(c.address, grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(
-			grpc.MaxCallRecvMsgSize(50*1024*1024), // 50MB
-			grpc.MaxCallSendMsgSize(50*1024*1024), // 50MB
-		))
+	conn, err := c.dial()
 	if err != nil {
 		return nil, err
 	}
@@ -448,11 +517,7 @@ func (c *Client) Rerank(ctx context.Context, in *pb.RerankRequest, opts ...grpc.
 	defer c.setBusy(false)
 	c.wdMark()
 	defer c.wdUnMark()
-	conn, err := grpc.Dial(c.address, grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(
-			grpc.MaxCallRecvMsgSize(50*1024*1024), // 50MB
-			grpc.MaxCallSendMsgSize(50*1024*1024), // 50MB
-		))
+	conn, err := c.dial()
 	if err != nil {
 		return nil, err
 	}
@@ -470,11 +535,7 @@ func (c *Client) GetTokenMetrics(ctx context.Context, in *pb.MetricsRequest, opt
 	defer c.setBusy(false)
 	c.wdMark()
 	defer c.wdUnMark()
-	conn, err := grpc.Dial(c.address, grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(
-			grpc.MaxCallRecvMsgSize(50*1024*1024), // 50MB
-			grpc.MaxCallSendMsgSize(50*1024*1024), // 50MB
-		))
+	conn, err := c.dial()
 	if err != nil {
 		return nil, err
 	}
@@ -492,15 +553,390 @@ func (c *Client) VAD(ctx context.Context, in *pb.VADRequest, opts ...grpc.CallOp
 	defer c.setBusy(false)
 	c.wdMark()
 	defer c.wdUnMark()
-	conn, err := grpc.Dial(c.address, grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(
-			grpc.MaxCallRecvMsgSize(50*1024*1024), // 50MB
-			grpc.MaxCallSendMsgSize(50*1024*1024), // 50MB
-		))
+	conn, err := c.dial()
 	if err != nil {
 		return nil, err
 	}
 	defer conn.Close()
 	client := pb.NewBackendClient(conn)
 	return client.VAD(ctx, in, opts...)
+}
+
+func (c *Client) Detect(ctx context.Context, in *pb.DetectOptions, opts ...grpc.CallOption) (*pb.DetectResponse, error) {
+	if !c.parallel {
+		c.opMutex.Lock()
+		defer c.opMutex.Unlock()
+	}
+	c.setBusy(true)
+	defer c.setBusy(false)
+	c.wdMark()
+	defer c.wdUnMark()
+	conn, err := c.dial()
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	client := pb.NewBackendClient(conn)
+	return client.Detect(ctx, in, opts...)
+}
+
+func (c *Client) FaceVerify(ctx context.Context, in *pb.FaceVerifyRequest, opts ...grpc.CallOption) (*pb.FaceVerifyResponse, error) {
+	if !c.parallel {
+		c.opMutex.Lock()
+		defer c.opMutex.Unlock()
+	}
+	c.setBusy(true)
+	defer c.setBusy(false)
+	c.wdMark()
+	defer c.wdUnMark()
+	conn, err := c.dial()
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	client := pb.NewBackendClient(conn)
+	return client.FaceVerify(ctx, in, opts...)
+}
+
+func (c *Client) FaceAnalyze(ctx context.Context, in *pb.FaceAnalyzeRequest, opts ...grpc.CallOption) (*pb.FaceAnalyzeResponse, error) {
+	if !c.parallel {
+		c.opMutex.Lock()
+		defer c.opMutex.Unlock()
+	}
+	c.setBusy(true)
+	defer c.setBusy(false)
+	c.wdMark()
+	defer c.wdUnMark()
+	conn, err := c.dial()
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	client := pb.NewBackendClient(conn)
+	return client.FaceAnalyze(ctx, in, opts...)
+}
+
+func (c *Client) VoiceVerify(ctx context.Context, in *pb.VoiceVerifyRequest, opts ...grpc.CallOption) (*pb.VoiceVerifyResponse, error) {
+	if !c.parallel {
+		c.opMutex.Lock()
+		defer c.opMutex.Unlock()
+	}
+	c.setBusy(true)
+	defer c.setBusy(false)
+	c.wdMark()
+	defer c.wdUnMark()
+	conn, err := c.dial()
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	client := pb.NewBackendClient(conn)
+	return client.VoiceVerify(ctx, in, opts...)
+}
+
+func (c *Client) VoiceAnalyze(ctx context.Context, in *pb.VoiceAnalyzeRequest, opts ...grpc.CallOption) (*pb.VoiceAnalyzeResponse, error) {
+	if !c.parallel {
+		c.opMutex.Lock()
+		defer c.opMutex.Unlock()
+	}
+	c.setBusy(true)
+	defer c.setBusy(false)
+	c.wdMark()
+	defer c.wdUnMark()
+	conn, err := c.dial()
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	client := pb.NewBackendClient(conn)
+	return client.VoiceAnalyze(ctx, in, opts...)
+}
+
+func (c *Client) VoiceEmbed(ctx context.Context, in *pb.VoiceEmbedRequest, opts ...grpc.CallOption) (*pb.VoiceEmbedResponse, error) {
+	if !c.parallel {
+		c.opMutex.Lock()
+		defer c.opMutex.Unlock()
+	}
+	c.setBusy(true)
+	defer c.setBusy(false)
+	c.wdMark()
+	defer c.wdUnMark()
+	conn, err := c.dial()
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	client := pb.NewBackendClient(conn)
+	return client.VoiceEmbed(ctx, in, opts...)
+}
+
+func (c *Client) AudioEncode(ctx context.Context, in *pb.AudioEncodeRequest, opts ...grpc.CallOption) (*pb.AudioEncodeResult, error) {
+	if !c.parallel {
+		c.opMutex.Lock()
+		defer c.opMutex.Unlock()
+	}
+	c.setBusy(true)
+	defer c.setBusy(false)
+	c.wdMark()
+	defer c.wdUnMark()
+	conn, err := c.dial()
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	client := pb.NewBackendClient(conn)
+	return client.AudioEncode(ctx, in, opts...)
+}
+
+func (c *Client) AudioDecode(ctx context.Context, in *pb.AudioDecodeRequest, opts ...grpc.CallOption) (*pb.AudioDecodeResult, error) {
+	if !c.parallel {
+		c.opMutex.Lock()
+		defer c.opMutex.Unlock()
+	}
+	c.setBusy(true)
+	defer c.setBusy(false)
+	c.wdMark()
+	defer c.wdUnMark()
+	conn, err := c.dial()
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	client := pb.NewBackendClient(conn)
+	return client.AudioDecode(ctx, in, opts...)
+}
+
+func (c *Client) StartFineTune(ctx context.Context, in *pb.FineTuneRequest, opts ...grpc.CallOption) (*pb.FineTuneJobResult, error) {
+	if !c.parallel {
+		c.opMutex.Lock()
+		defer c.opMutex.Unlock()
+	}
+	c.setBusy(true)
+	defer c.setBusy(false)
+	c.wdMark()
+	defer c.wdUnMark()
+	conn, err := c.dial()
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	client := pb.NewBackendClient(conn)
+	return client.StartFineTune(ctx, in, opts...)
+}
+
+func (c *Client) FineTuneProgress(ctx context.Context, in *pb.FineTuneProgressRequest, f func(update *pb.FineTuneProgressUpdate), opts ...grpc.CallOption) error {
+	if !c.parallel {
+		c.opMutex.Lock()
+		defer c.opMutex.Unlock()
+	}
+	c.setBusy(true)
+	defer c.setBusy(false)
+	c.wdMark()
+	defer c.wdUnMark()
+	conn, err := c.dial()
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	client := pb.NewBackendClient(conn)
+
+	stream, err := client.FineTuneProgress(ctx, in, opts...)
+	if err != nil {
+		return err
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		update, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return err
+		}
+		f(update)
+	}
+
+	return nil
+}
+
+func (c *Client) StopFineTune(ctx context.Context, in *pb.FineTuneStopRequest, opts ...grpc.CallOption) (*pb.Result, error) {
+	if !c.parallel {
+		c.opMutex.Lock()
+		defer c.opMutex.Unlock()
+	}
+	c.setBusy(true)
+	defer c.setBusy(false)
+	c.wdMark()
+	defer c.wdUnMark()
+	conn, err := c.dial()
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	client := pb.NewBackendClient(conn)
+	return client.StopFineTune(ctx, in, opts...)
+}
+
+func (c *Client) ListCheckpoints(ctx context.Context, in *pb.ListCheckpointsRequest, opts ...grpc.CallOption) (*pb.ListCheckpointsResponse, error) {
+	if !c.parallel {
+		c.opMutex.Lock()
+		defer c.opMutex.Unlock()
+	}
+	c.setBusy(true)
+	defer c.setBusy(false)
+	c.wdMark()
+	defer c.wdUnMark()
+	conn, err := c.dial()
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	client := pb.NewBackendClient(conn)
+	return client.ListCheckpoints(ctx, in, opts...)
+}
+
+func (c *Client) ExportModel(ctx context.Context, in *pb.ExportModelRequest, opts ...grpc.CallOption) (*pb.Result, error) {
+	if !c.parallel {
+		c.opMutex.Lock()
+		defer c.opMutex.Unlock()
+	}
+	c.setBusy(true)
+	defer c.setBusy(false)
+	c.wdMark()
+	defer c.wdUnMark()
+	conn, err := c.dial()
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	client := pb.NewBackendClient(conn)
+	return client.ExportModel(ctx, in, opts...)
+}
+
+func (c *Client) StartQuantization(ctx context.Context, in *pb.QuantizationRequest, opts ...grpc.CallOption) (*pb.QuantizationJobResult, error) {
+	if !c.parallel {
+		c.opMutex.Lock()
+		defer c.opMutex.Unlock()
+	}
+	c.setBusy(true)
+	defer c.setBusy(false)
+	c.wdMark()
+	defer c.wdUnMark()
+	conn, err := c.dial()
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	client := pb.NewBackendClient(conn)
+	return client.StartQuantization(ctx, in, opts...)
+}
+
+func (c *Client) QuantizationProgress(ctx context.Context, in *pb.QuantizationProgressRequest, f func(update *pb.QuantizationProgressUpdate), opts ...grpc.CallOption) error {
+	if !c.parallel {
+		c.opMutex.Lock()
+		defer c.opMutex.Unlock()
+	}
+	c.setBusy(true)
+	defer c.setBusy(false)
+	c.wdMark()
+	defer c.wdUnMark()
+	conn, err := c.dial()
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	client := pb.NewBackendClient(conn)
+
+	stream, err := client.QuantizationProgress(ctx, in, opts...)
+	if err != nil {
+		return err
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		update, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return err
+		}
+		f(update)
+	}
+
+	return nil
+}
+
+func (c *Client) StopQuantization(ctx context.Context, in *pb.QuantizationStopRequest, opts ...grpc.CallOption) (*pb.Result, error) {
+	if !c.parallel {
+		c.opMutex.Lock()
+		defer c.opMutex.Unlock()
+	}
+	c.setBusy(true)
+	defer c.setBusy(false)
+	c.wdMark()
+	defer c.wdUnMark()
+	conn, err := c.dial()
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	client := pb.NewBackendClient(conn)
+	return client.StopQuantization(ctx, in, opts...)
+}
+
+func (c *Client) Free(ctx context.Context) error {
+	if !c.parallel {
+		c.opMutex.Lock()
+		defer c.opMutex.Unlock()
+	}
+	c.setBusy(true)
+	defer c.setBusy(false)
+	c.wdMark()
+	defer c.wdUnMark()
+
+	conn, err := c.dial()
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	client := pb.NewBackendClient(conn)
+	_, err = client.Free(ctx, &pb.HealthMessage{})
+	return err
+}
+
+func (c *Client) ModelMetadata(ctx context.Context, in *pb.ModelOptions, opts ...grpc.CallOption) (*pb.ModelMetadataResponse, error) {
+	if !c.parallel {
+		c.opMutex.Lock()
+		defer c.opMutex.Unlock()
+	}
+	c.setBusy(true)
+	defer c.setBusy(false)
+	c.wdMark()
+	defer c.wdUnMark()
+	conn, err := c.dial()
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	client := pb.NewBackendClient(conn)
+	return client.ModelMetadata(ctx, in, opts...)
 }

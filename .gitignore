@@ -5,9 +5,14 @@ __pycache__/
 *.o
 get-sources
 prepare-sources
-/backend/cpp/llama/grpc-server
-/backend/cpp/llama/llama.cpp
+/backend/cpp/llama-cpp/grpc-server
+/backend/cpp/llama-cpp/llama.cpp
 /backend/cpp/llama-*
+!backend/cpp/llama-cpp
+/backends
+/backend-images
+/result.yaml
+protoc
 
 *.log
 
@@ -19,7 +24,8 @@ go-bert
 
 # LocalAI build binary
 LocalAI
-local-ai
+/local-ai
+/local-ai-launcher
 # prevent above rules from omitting the helm chart
 !charts/*
 # prevent above rules from omitting the api/localai folder
@@ -30,6 +36,8 @@ local-ai
 models/*
 test-models/
 test-dir/
+tests/e2e-aio/backends
+mock-backend
 
 release/
 
@@ -57,3 +65,15 @@ docs/static/gallery.html
 
 # per-developer customization files for the development container
 .devcontainer/customization/*
+
+# React UI build artifacts (keep placeholder dist/index.html)
+core/http/react-ui/node_modules/
+core/http/react-ui/dist
+
+# Extracted backend binaries for container-based testing
+local-backends/
+
+# UI E2E test artifacts
+tests/e2e-ui/ui-test-server
+core/http/react-ui/playwright-report/
+core/http/react-ui/test-results/

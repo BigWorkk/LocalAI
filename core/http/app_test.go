@@ -9,24 +9,24 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"runtime"
+	"time"
 
 	"github.com/mudler/LocalAI/core/application"
 	"github.com/mudler/LocalAI/core/config"
 	. "github.com/mudler/LocalAI/core/http"
 	"github.com/mudler/LocalAI/core/schema"
 
-	"github.com/gofiber/fiber/v2"
+	"github.com/labstack/echo/v4"
 	"github.com/mudler/LocalAI/core/gallery"
 	"github.com/mudler/LocalAI/pkg/downloader"
+	"github.com/mudler/LocalAI/pkg/system"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"gopkg.in/yaml.v3"
 
-	rice "github.com/GeertJohan/go.rice"
+	"github.com/mudler/xlog"
 	openaigo "github.com/otiai10/openaigo"
 	"github.com/sashabaranov/go-openai"
-	"github.com/sashabaranov/go-openai/jsonschema"
 )
 
 const apiKey = "joshua"
@@ -35,21 +35,21 @@ const bearerKey = "Bearer " + apiKey
 const testPrompt = `### System:
 You are an AI assistant that follows instruction extremely well. Help as much as you can.
 
-### User:
+### Instruction:
 
-Can you help rephrasing sentences?
+Say hello.
 
 ### Response:`
 
 type modelApplyRequest struct {
-	ID        string                 `json:"id"`
-	URL       string                 `json:"url"`
-	ConfigURL string                 `json:"config_url"`
-	Name      string                 `json:"name"`
-	Overrides map[string]interface{} `json:"overrides"`
+	ID        string         `json:"id"`
+	URL       string         `json:"url"`
+	ConfigURL string         `json:"config_url"`
+	Name      string         `json:"name"`
+	Overrides map[string]any `json:"overrides"`
 }
 
-func getModelStatus(url string) (response map[string]interface{}) {
+func getModelStatus(url string) (response map[string]any) {
 	// Create the HTTP request
 	req, err := http.NewRequest("GET", url, nil)
 	req.Header.Set("Content-Type", "application/json")
@@ -85,14 +85,14 @@ func getModels(url string) ([]gallery.GalleryModel, error) {
 	response := []gallery.GalleryModel{}
 	uri := downloader.URI(url)
 	// TODO: No tests currently seem to exercise file:// urls. Fix?
-	err := uri.DownloadWithAuthorizationAndCallback("", bearerKey, func(url string, i []byte) error {
+	err := uri.ReadWithAuthorizationAndCallback(context.TODO(), "", bearerKey, func(url string, i []byte) error {
 		// Unmarshal YAML data into a struct
 		return json.Unmarshal(i, &response)
 	})
 	return response, err
 }
 
-func postModelApplyRequest(url string, request modelApplyRequest) (response map[string]interface{}) {
+func postModelApplyRequest(url string, request modelApplyRequest) (response map[string]any) {
 
 	//url := "http://localhost:AI/models/apply"
 
@@ -208,6 +208,41 @@ func postRequestResponseJSON[B1 any, B2 any](url string, reqJson *B1, respJson *
 	return json.Unmarshal(body, respJson)
 }
 
+func putRequestJSON[B any](url string, bodyJson *B) error {
+	payload, err := json.Marshal(bodyJson)
+	if err != nil {
+		return err
+	}
+
+	GinkgoWriter.Printf("PUT %s: %s\n", url, string(payload))
+
+	req, err := http.NewRequest("PUT", url, bytes.NewBuffer(payload))
+	if err != nil {
+		return err
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", bearerKey)
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
+		return fmt.Errorf("unexpected status code: %d, body: %s", resp.StatusCode, string(body))
+	}
+
+	return nil
+}
+
 func postInvalidRequest(url string) (error, int) {
 
 	req, err := http.NewRequest("POST", url, bytes.NewBufferString("invalid request"))
@@ -264,19 +299,9 @@ func getRequest(url string, header http.Header) (error, int, []byte) {
 
 const bertEmbeddingsURL = `https://gist.githubusercontent.com/mudler/0a080b166b87640e8644b09c2aee6e3b/raw/f0e8c26bb72edc16d9fbafbfd6638072126ff225/bert-embeddings-gallery.yaml`
 
-var backendAssets *rice.Box
-
-func init() {
-	var err error
-	backendAssets, err = rice.FindBox("backend-assets")
-	if err != nil {
-		panic(err)
-	}
-}
-
 var _ = Describe("API test", func() {
 
-	var app *fiber.App
+	var app *echo.Echo
 	var client *openai.Client
 	var client2 *openaigo.Client
 	var c context.Context
@@ -295,11 +320,12 @@ var _ = Describe("API test", func() {
 			tmpdir, err = os.MkdirTemp("", "")
 			Expect(err).ToNot(HaveOccurred())
 
+			// No real backends needed — these specs cover gallery API, auth,
+			// routing, and file:// import. Use the suite-level empty backend dir.
+			backendPath := backendDir
+
 			modelDir = filepath.Join(tmpdir, "models")
 			err = os.Mkdir(modelDir, 0750)
-			Expect(err).ToNot(HaveOccurred())
-			backendAssetsDir := filepath.Join(tmpdir, "backend-assets")
-			err = os.Mkdir(backendAssetsDir, 0750)
 			Expect(err).ToNot(HaveOccurred())
 
 			c, cancel = context.WithCancel(context.Background())
@@ -310,6 +336,7 @@ var _ = Describe("API test", func() {
 						Name: "bert",
 						URL:  bertEmbeddingsURL,
 					},
+					Overrides: map[string]any{"backend": "llama-cpp"},
 				},
 				{
 					Metadata: gallery.Metadata{
@@ -317,7 +344,7 @@ var _ = Describe("API test", func() {
 						URL:             bertEmbeddingsURL,
 						AdditionalFiles: []gallery.File{{Filename: "foo.yaml", URI: bertEmbeddingsURL}},
 					},
-					Overrides: map[string]interface{}{"foo": "bar"},
+					Overrides: map[string]any{"foo": "bar"},
 				},
 			}
 			out, err := yaml.Marshal(g)
@@ -332,20 +359,29 @@ var _ = Describe("API test", func() {
 				},
 			}
 
+			systemState, err := system.GetSystemState(
+				system.WithBackendPath(backendPath),
+				system.WithModelPath(modelDir),
+			)
+			Expect(err).ToNot(HaveOccurred())
+
 			application, err := application.New(
 				append(commonOpts,
 					config.WithContext(c),
+					config.WithSystemState(systemState),
 					config.WithGalleries(galleries),
-					config.WithModelPath(modelDir),
 					config.WithApiKeys([]string{apiKey}),
-					config.WithBackendAssets(backendAssets),
-					config.WithBackendAssetsOutput(backendAssetsDir))...)
+				)...)
 			Expect(err).ToNot(HaveOccurred())
 
 			app, err = API(application)
 			Expect(err).ToNot(HaveOccurred())
 
-			go app.Listen("127.0.0.1:9090")
+			go func() {
+				if err := app.Start("127.0.0.1:9090"); err != nil && err != http.ErrServerClosed {
+					xlog.Error("server error", "error", err)
+				}
+			}()
 
 			defaultConfig := openai.DefaultConfig(apiKey)
 			defaultConfig.BaseURL = "http://127.0.0.1:9090/v1"
@@ -364,7 +400,9 @@ var _ = Describe("API test", func() {
 		AfterEach(func(sc SpecContext) {
 			cancel()
 			if app != nil {
-				err := app.Shutdown()
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				err := app.Shutdown(ctx)
 				Expect(err).ToNot(HaveOccurred())
 			}
 			err := os.RemoveAll(tmpdir)
@@ -390,8 +428,10 @@ var _ = Describe("API test", func() {
 					"X-Forwarded-Prefix": {"/myprefix/"},
 				})
 				Expect(err).To(BeNil(), "error")
-				Expect(sc).To(Equal(401), "status code")
+				Expect(sc).To(Equal(200), "status code")
+				// Non-API paths pass through to the React SPA (which handles login client-side)
 				Expect(string(body)).To(ContainSubstring(`<base href="https://example.org/myprefix/" />`), "body")
+				Expect(string(body)).To(ContainSubstring(`<div id="root">`), "should serve React SPA")
 			})
 
 			It("Should support reverse-proxy when authenticated", func() {
@@ -424,7 +464,7 @@ var _ = Describe("API test", func() {
 				Expect(response["uuid"]).ToNot(BeEmpty(), fmt.Sprint(response))
 
 				uuid := response["uuid"].(string)
-				resp := map[string]interface{}{}
+				resp := map[string]any{}
 				Eventually(func() bool {
 					response := getModelStatus("http://127.0.0.1:9090/models/jobs/" + uuid)
 					fmt.Println(response)
@@ -439,7 +479,7 @@ var _ = Describe("API test", func() {
 				_, err = os.ReadFile(filepath.Join(modelDir, "foo.yaml"))
 				Expect(err).ToNot(HaveOccurred())
 
-				content := map[string]interface{}{}
+				content := map[string]any{}
 				err = yaml.Unmarshal(dat, &content)
 				Expect(err).ToNot(HaveOccurred())
 				Expect(content["usage"]).To(ContainSubstring("You can test this model with curl like this"))
@@ -463,7 +503,7 @@ var _ = Describe("API test", func() {
 				response := postModelApplyRequest("http://127.0.0.1:9090/models/apply", modelApplyRequest{
 					URL:  bertEmbeddingsURL,
 					Name: "bert",
-					Overrides: map[string]interface{}{
+					Overrides: map[string]any{
 						"backend": "llama",
 					},
 				})
@@ -480,39 +520,16 @@ var _ = Describe("API test", func() {
 				dat, err := os.ReadFile(filepath.Join(modelDir, "bert.yaml"))
 				Expect(err).ToNot(HaveOccurred())
 
-				content := map[string]interface{}{}
+				content := map[string]any{}
 				err = yaml.Unmarshal(dat, &content)
 				Expect(err).ToNot(HaveOccurred())
 				Expect(content["backend"]).To(Equal("llama"))
-			})
-			It("apply models from config", func() {
-				response := postModelApplyRequest("http://127.0.0.1:9090/models/apply", modelApplyRequest{
-					ConfigURL: "https://raw.githubusercontent.com/mudler/LocalAI/v2.25.0/embedded/models/hermes-2-pro-mistral.yaml",
-				})
-
-				Expect(response["uuid"]).ToNot(BeEmpty(), fmt.Sprint(response))
-
-				uuid := response["uuid"].(string)
-
-				Eventually(func() bool {
-					response := getModelStatus("http://127.0.0.1:9090/models/jobs/" + uuid)
-					return response["processed"].(bool)
-				}, "900s", "10s").Should(Equal(true))
-
-				Eventually(func() []string {
-					models, _ := client.ListModels(context.TODO())
-					modelList := []string{}
-					for _, m := range models.Models {
-						modelList = append(modelList, m.ID)
-					}
-					return modelList
-				}, "360s", "10s").Should(ContainElements("hermes-2-pro-mistral"))
 			})
 			It("apply models without overrides", func() {
 				response := postModelApplyRequest("http://127.0.0.1:9090/models/apply", modelApplyRequest{
 					URL:       bertEmbeddingsURL,
 					Name:      "bert",
-					Overrides: map[string]interface{}{},
+					Overrides: map[string]any{},
 				})
 
 				Expect(response["uuid"]).ToNot(BeEmpty(), fmt.Sprint(response))
@@ -527,251 +544,176 @@ var _ = Describe("API test", func() {
 				dat, err := os.ReadFile(filepath.Join(modelDir, "bert.yaml"))
 				Expect(err).ToNot(HaveOccurred())
 
-				content := map[string]interface{}{}
+				content := map[string]any{}
 				err = yaml.Unmarshal(dat, &content)
 				Expect(err).ToNot(HaveOccurred())
 				Expect(content["usage"]).To(ContainSubstring("You can test this model with curl like this"))
 			})
 
-			It("runs openllama gguf(llama-cpp)", Label("llama-gguf"), func() {
-				if runtime.GOOS != "linux" {
-					Skip("test supported only on linux")
+		})
+
+		Context("Importing models from URI", func() {
+			var testYamlFile string
+
+			BeforeEach(func() {
+				// Create a test YAML config file
+				yamlContent := `name: test-import-model
+backend: llama-cpp
+description: Test model imported from file URI
+parameters:
+  model: path/to/model.gguf
+  temperature: 0.7
+`
+				testYamlFile = filepath.Join(tmpdir, "test-import.yaml")
+				err := os.WriteFile(testYamlFile, []byte(yamlContent), 0644)
+				Expect(err).ToNot(HaveOccurred())
+			})
+
+			AfterEach(func() {
+				err := os.Remove(testYamlFile)
+				Expect(err).ToNot(HaveOccurred())
+			})
+
+			It("should import model from file:// URI pointing to local YAML config", func() {
+				importReq := schema.ImportModelRequest{
+					URI:         "file://" + testYamlFile,
+					Preferences: json.RawMessage(`{}`),
 				}
 
-				modelName := "hermes-2-pro-mistral"
-				response := postModelApplyRequest("http://127.0.0.1:9090/models/apply", modelApplyRequest{
-					ConfigURL: "https://raw.githubusercontent.com/mudler/LocalAI/v2.25.0/embedded/models/hermes-2-pro-mistral.yaml",
-				})
+				var response schema.GalleryResponse
+				err := postRequestResponseJSON("http://127.0.0.1:9090/models/import-uri", &importReq, &response)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(response.ID).ToNot(BeEmpty())
 
-				Expect(response["uuid"]).ToNot(BeEmpty(), fmt.Sprint(response))
-
-				uuid := response["uuid"].(string)
-
+				uuid := response.ID
+				resp := map[string]any{}
 				Eventually(func() bool {
 					response := getModelStatus("http://127.0.0.1:9090/models/jobs/" + uuid)
+					resp = response
 					return response["processed"].(bool)
-				}, "900s", "10s").Should(Equal(true))
+				}, "360s", "10s").Should(Equal(true))
 
-				By("testing chat")
-				resp, err := client.CreateChatCompletion(context.TODO(), openai.ChatCompletionRequest{Model: modelName, Messages: []openai.ChatCompletionMessage{
-					{
-						Role:    "user",
-						Content: "How much is 2+2?",
-					},
-				}})
+				// Check that the model was imported successfully
+				Expect(resp["message"]).ToNot(ContainSubstring("error"))
+				Expect(resp["error"]).To(BeNil())
+
+				// Verify the model config file was created
+				dat, err := os.ReadFile(filepath.Join(modelDir, "test-import-model.yaml"))
 				Expect(err).ToNot(HaveOccurred())
-				Expect(len(resp.Choices)).To(Equal(1))
-				Expect(resp.Choices[0].Message.Content).To(Or(ContainSubstring("4"), ContainSubstring("four")))
 
-				By("testing functions")
-				resp2, err := client.CreateChatCompletion(
-					context.TODO(),
-					openai.ChatCompletionRequest{
-						Model: modelName,
-						Messages: []openai.ChatCompletionMessage{
-							{
-								Role:    "user",
-								Content: "What is the weather like in San Francisco (celsius)?",
-							},
-						},
-						Functions: []openai.FunctionDefinition{
-							openai.FunctionDefinition{
-								Name:        "get_current_weather",
-								Description: "Get the current weather",
-								Parameters: jsonschema.Definition{
-									Type: jsonschema.Object,
-									Properties: map[string]jsonschema.Definition{
-										"location": {
-											Type:        jsonschema.String,
-											Description: "The city and state, e.g. San Francisco, CA",
-										},
-										"unit": {
-											Type: jsonschema.String,
-											Enum: []string{"celcius", "fahrenheit"},
-										},
-									},
-									Required: []string{"location"},
-								},
-							},
-						},
-					})
+				content := map[string]any{}
+				err = yaml.Unmarshal(dat, &content)
 				Expect(err).ToNot(HaveOccurred())
-				Expect(len(resp2.Choices)).To(Equal(1))
-				Expect(resp2.Choices[0].Message.FunctionCall).ToNot(BeNil())
-				Expect(resp2.Choices[0].Message.FunctionCall.Name).To(Equal("get_current_weather"), resp2.Choices[0].Message.FunctionCall.Name)
-
-				var res map[string]string
-				err = json.Unmarshal([]byte(resp2.Choices[0].Message.FunctionCall.Arguments), &res)
-				Expect(err).ToNot(HaveOccurred())
-				Expect(res["location"]).To(ContainSubstring("San Francisco"), fmt.Sprint(res))
-				Expect(res["unit"]).To(Equal("celcius"), fmt.Sprint(res))
-				Expect(string(resp2.Choices[0].FinishReason)).To(Equal("function_call"), fmt.Sprint(resp2.Choices[0].FinishReason))
-			})
-		})
-	})
-
-	Context("Model gallery", func() {
-		BeforeEach(func() {
-			var err error
-			tmpdir, err = os.MkdirTemp("", "")
-			Expect(err).ToNot(HaveOccurred())
-			modelDir = filepath.Join(tmpdir, "models")
-			backendAssetsDir := filepath.Join(tmpdir, "backend-assets")
-			err = os.Mkdir(backendAssetsDir, 0750)
-			Expect(err).ToNot(HaveOccurred())
-
-			c, cancel = context.WithCancel(context.Background())
-
-			galleries := []config.Gallery{
-				{
-					Name: "model-gallery",
-					URL:  "https://raw.githubusercontent.com/go-skynet/model-gallery/main/index.yaml",
-				},
-				{
-					Name: "localai",
-					URL:  "https://raw.githubusercontent.com/mudler/LocalAI/refs/heads/master/gallery/index.yaml",
-				},
-			}
-
-			application, err := application.New(
-				append(commonOpts,
-					config.WithContext(c),
-					config.WithGeneratedContentDir(tmpdir),
-					config.WithGalleries(galleries),
-					config.WithModelPath(modelDir),
-					config.WithBackendAssets(backendAssets),
-					config.WithBackendAssetsOutput(tmpdir))...,
-			)
-			Expect(err).ToNot(HaveOccurred())
-			app, err = API(application)
-			Expect(err).ToNot(HaveOccurred())
-
-			go app.Listen("127.0.0.1:9090")
-
-			defaultConfig := openai.DefaultConfig("")
-			defaultConfig.BaseURL = "http://127.0.0.1:9090/v1"
-
-			client2 = openaigo.NewClient("")
-			client2.BaseURL = defaultConfig.BaseURL
-
-			// Wait for API to be ready
-			client = openai.NewClientWithConfig(defaultConfig)
-			Eventually(func() error {
-				_, err := client.ListModels(context.TODO())
-				return err
-			}, "2m").ShouldNot(HaveOccurred())
-		})
-
-		AfterEach(func() {
-			cancel()
-			if app != nil {
-				err := app.Shutdown()
-				Expect(err).ToNot(HaveOccurred())
-			}
-			err := os.RemoveAll(tmpdir)
-			Expect(err).ToNot(HaveOccurred())
-			_, err = os.ReadDir(tmpdir)
-			Expect(err).To(HaveOccurred())
-		})
-		It("installs and is capable to run tts", Label("tts"), func() {
-			if runtime.GOOS != "linux" {
-				Skip("test supported only on linux")
-			}
-
-			response := postModelApplyRequest("http://127.0.0.1:9090/models/apply", modelApplyRequest{
-				ID: "model-gallery@voice-en-us-kathleen-low",
+				Expect(content["name"]).To(Equal("test-import-model"))
+				Expect(content["backend"]).To(Equal("llama-cpp"))
 			})
 
-			Expect(response["uuid"]).ToNot(BeEmpty(), fmt.Sprint(response))
+			It("should return error when file:// URI points to non-existent file", func() {
+				nonExistentFile := filepath.Join(tmpdir, "nonexistent.yaml")
+				importReq := schema.ImportModelRequest{
+					URI:         "file://" + nonExistentFile,
+					Preferences: json.RawMessage(`{}`),
+				}
 
-			uuid := response["uuid"].(string)
-
-			Eventually(func() bool {
-				response := getModelStatus("http://127.0.0.1:9090/models/jobs/" + uuid)
-				fmt.Println(response)
-				return response["processed"].(bool)
-			}, "360s", "10s").Should(Equal(true))
-
-			// An HTTP Post to the /tts endpoint should return a wav audio file
-			resp, err := http.Post("http://127.0.0.1:9090/tts", "application/json", bytes.NewBuffer([]byte(`{"input": "Hello world", "model": "en-us-kathleen-low.onnx"}`)))
-			Expect(err).ToNot(HaveOccurred(), fmt.Sprint(resp))
-			dat, err := io.ReadAll(resp.Body)
-			Expect(err).ToNot(HaveOccurred(), fmt.Sprint(resp))
-
-			Expect(resp.StatusCode).To(Equal(200), fmt.Sprint(string(dat)))
-			Expect(resp.Header.Get("Content-Type")).To(Or(Equal("audio/x-wav"), Equal("audio/vnd.wave")))
+				var response schema.GalleryResponse
+				err := postRequestResponseJSON("http://127.0.0.1:9090/models/import-uri", &importReq, &response)
+				// The endpoint should return an error immediately
+				Expect(err).To(HaveOccurred())
+				Expect(err.Error()).To(ContainSubstring("failed to discover model config"))
+			})
 		})
-		It("installs and is capable to generate images", Label("stablediffusion"), func() {
-			if runtime.GOOS != "linux" {
-				Skip("test supported only on linux")
-			}
 
-			response := postModelApplyRequest("http://127.0.0.1:9090/models/apply", modelApplyRequest{
-				ID:   "localai@sd-1.5-ggml",
-				Name: "stablediffusion",
+		Context("Importing models from URI can't point to absolute paths", func() {
+			var testYamlFile string
+
+			BeforeEach(func() {
+				// Create a test YAML config file
+				yamlContent := `name: test-import-model
+backend: llama-cpp
+description: Test model imported from file URI
+parameters:
+  model: /path/to/model.gguf
+  temperature: 0.7
+`
+				testYamlFile = filepath.Join(tmpdir, "test-import.yaml")
+				err := os.WriteFile(testYamlFile, []byte(yamlContent), 0644)
+				Expect(err).ToNot(HaveOccurred())
 			})
 
-			Expect(response["uuid"]).ToNot(BeEmpty(), fmt.Sprint(response))
+			AfterEach(func() {
+				err := os.Remove(testYamlFile)
+				Expect(err).ToNot(HaveOccurred())
+			})
 
-			uuid := response["uuid"].(string)
+			It("should fail to import model from file:// URI pointing to local YAML config", func() {
+				importReq := schema.ImportModelRequest{
+					URI:         "file://" + testYamlFile,
+					Preferences: json.RawMessage(`{}`),
+				}
 
-			Eventually(func() bool {
-				response := getModelStatus("http://127.0.0.1:9090/models/jobs/" + uuid)
-				fmt.Println(response)
-				return response["processed"].(bool)
-			}, "1200s", "10s").Should(Equal(true))
+				var response schema.GalleryResponse
+				err := postRequestResponseJSON("http://127.0.0.1:9090/models/import-uri", &importReq, &response)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(response.ID).ToNot(BeEmpty())
 
-			resp, err := http.Post(
-				"http://127.0.0.1:9090/v1/images/generations",
-				"application/json",
-				bytes.NewBuffer([]byte(`{
-					 			"prompt": "a lovely cat",
-								"step": 1,  "seed":9000,
-					 			"size": "256x256", "n":2}`)))
-			// The response should contain an URL
-			Expect(err).ToNot(HaveOccurred(), fmt.Sprint(resp))
-			dat, err := io.ReadAll(resp.Body)
-			Expect(err).ToNot(HaveOccurred(), "error reading /image/generations response")
+				uuid := response.ID
+				resp := map[string]any{}
+				Eventually(func() bool {
+					response := getModelStatus("http://127.0.0.1:9090/models/jobs/" + uuid)
+					resp = response
+					return response["processed"].(bool)
+				}, "360s", "10s").Should(Equal(true))
 
-			imgUrlResp := &schema.OpenAIResponse{}
-			err = json.Unmarshal(dat, imgUrlResp)
-			Expect(err).ToNot(HaveOccurred(), fmt.Sprint(dat))
-			Expect(imgUrlResp.Data).ToNot(Or(BeNil(), BeZero()))
-			imgUrl := imgUrlResp.Data[0].URL
-			Expect(imgUrl).To(ContainSubstring("http://127.0.0.1:9090/"), imgUrl)
-			Expect(imgUrl).To(ContainSubstring(".png"), imgUrl)
-
-			imgResp, err := http.Get(imgUrl)
-			Expect(err).To(BeNil())
-			Expect(imgResp).ToNot(BeNil())
-			Expect(imgResp.StatusCode).To(Equal(200))
-			Expect(imgResp.ContentLength).To(BeNumerically(">", 0))
-			imgData := make([]byte, 512)
-			count, err := io.ReadFull(imgResp.Body, imgData)
-			Expect(err).To(Or(BeNil(), MatchError(io.EOF)))
-			Expect(count).To(BeNumerically(">", 0))
-			Expect(count).To(BeNumerically("<=", 512))
-			Expect(http.DetectContentType(imgData)).To(Equal("image/png"))
+				// Check that the model was imported successfully
+				Expect(resp["message"]).To(ContainSubstring("error"))
+				Expect(resp["error"]).ToNot(BeNil())
+			})
 		})
 	})
 
 	Context("API query", func() {
 		BeforeEach(func() {
-			modelPath := os.Getenv("MODELS_PATH")
+			if mockBackendPath == "" {
+				Skip("mock-backend binary not built; run 'make build-mock-backend'")
+			}
 			c, cancel = context.WithCancel(context.Background())
 
+			// Stand up an isolated model dir for this Context so the suite can
+			// register a mock-model config (read by /v1/models, /system, and the
+			// agent-jobs flow) without depending on real backend builds.
 			var err error
+			tmpdir, err = os.MkdirTemp("", "")
+			Expect(err).ToNot(HaveOccurred())
+			modelDir = filepath.Join(tmpdir, "models")
+			Expect(os.Mkdir(modelDir, 0750)).To(Succeed())
+
+			mockModelYAML := `name: mock-model
+backend: mock-backend
+parameters:
+  model: mock-model.bin
+`
+			Expect(os.WriteFile(filepath.Join(modelDir, "mock-model.yaml"), []byte(mockModelYAML), 0644)).To(Succeed())
+
+			systemState, err := system.GetSystemState(
+				system.WithBackendPath(backendDir),
+				system.WithModelPath(modelDir),
+			)
+			Expect(err).ToNot(HaveOccurred())
 
 			application, err := application.New(
 				append(commonOpts,
-					config.WithExternalBackend("transformers", os.Getenv("HUGGINGFACE_GRPC")),
 					config.WithContext(c),
-					config.WithModelPath(modelPath),
+					config.WithSystemState(systemState),
 				)...)
 			Expect(err).ToNot(HaveOccurred())
+			application.ModelLoader().SetExternalBackend("mock-backend", mockBackendPath)
 			app, err = API(application)
 			Expect(err).ToNot(HaveOccurred())
-			go app.Listen("127.0.0.1:9090")
+			go func() {
+				if err := app.Start("127.0.0.1:9090"); err != nil && err != http.ErrServerClosed {
+					xlog.Error("server error", "error", err)
+				}
+			}()
 
 			defaultConfig := openai.DefaultConfig("")
 			defaultConfig.BaseURL = "http://127.0.0.1:9090/v1"
@@ -789,208 +731,231 @@ var _ = Describe("API test", func() {
 		AfterEach(func() {
 			cancel()
 			if app != nil {
-				err := app.Shutdown()
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				err := app.Shutdown(ctx)
 				Expect(err).ToNot(HaveOccurred())
 			}
+			Expect(os.RemoveAll(tmpdir)).To(Succeed())
 		})
 		It("returns the models list", func() {
 			models, err := client.ListModels(context.TODO())
 			Expect(err).ToNot(HaveOccurred())
-			Expect(len(models.Models)).To(Equal(7)) // If "config.yaml" should be included, this should be 8?
-		})
-		It("can generate completions via ggml", func() {
-			resp, err := client.CreateCompletion(context.TODO(), openai.CompletionRequest{Model: "testmodel.ggml", Prompt: testPrompt})
-			Expect(err).ToNot(HaveOccurred())
-			Expect(len(resp.Choices)).To(Equal(1))
-			Expect(resp.Choices[0].Text).ToNot(BeEmpty())
-		})
-
-		It("can generate chat completions via ggml", func() {
-			resp, err := client.CreateChatCompletion(context.TODO(), openai.ChatCompletionRequest{Model: "testmodel.ggml", Messages: []openai.ChatCompletionMessage{openai.ChatCompletionMessage{Role: "user", Content: testPrompt}}})
-			Expect(err).ToNot(HaveOccurred())
-			Expect(len(resp.Choices)).To(Equal(1))
-			Expect(resp.Choices[0].Message.Content).ToNot(BeEmpty())
+			Expect(len(models.Models)).To(BeNumerically(">=", 1))
 		})
 
 		It("returns errors", func() {
 			_, err := client.CreateCompletion(context.TODO(), openai.CompletionRequest{Model: "foomodel", Prompt: testPrompt})
 			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("error, status code: 500, message: could not load model - all backends returned error:"))
+			Expect(err.Error()).To(ContainSubstring("error, status code: 404, status: 404 Not Found"))
 		})
 
-		It("shows the external backend", func() {
-			// do an http request to the /system endpoint
+		It("shows the external backend on /system", func() {
+			// /system reports the backends available to the application.
+			// Mock-backend is registered via SetExternalBackend so it appears
+			// alongside any built-in entries; verifying that string proves the
+			// endpoint is wired up regardless of which real backends exist.
 			resp, err := http.Get("http://127.0.0.1:9090/system")
 			Expect(err).ToNot(HaveOccurred())
 			Expect(resp.StatusCode).To(Equal(200))
 			dat, err := io.ReadAll(resp.Body)
 			Expect(err).ToNot(HaveOccurred())
-			Expect(string(dat)).To(ContainSubstring("huggingface"))
-			Expect(string(dat)).To(ContainSubstring("llama-cpp"))
+			Expect(string(dat)).To(ContainSubstring("mock-backend"))
 		})
 
-		It("transcribes audio", func() {
-			if runtime.GOOS != "linux" {
-				Skip("test supported only on linux")
-			}
-			resp, err := client.CreateTranscription(
-				context.Background(),
-				openai.AudioRequest{
-					Model:    openai.Whisper1,
-					FilePath: filepath.Join(os.Getenv("TEST_DIR"), "audio.wav"),
-				},
-			)
-			Expect(err).ToNot(HaveOccurred())
-			Expect(resp.Text).To(ContainSubstring("This is the Micro Machine Man presenting"))
-		})
-
-		It("calculate embeddings", func() {
-			if runtime.GOOS != "linux" {
-				Skip("test supported only on linux")
-			}
-			resp, err := client.CreateEmbeddings(
-				context.Background(),
-				openai.EmbeddingRequest{
-					Model: openai.AdaEmbeddingV2,
-					Input: []string{"sun", "cat"},
-				},
-			)
-			Expect(err).ToNot(HaveOccurred(), err)
-			Expect(len(resp.Data[0].Embedding)).To(BeNumerically("==", 2048))
-			Expect(len(resp.Data[1].Embedding)).To(BeNumerically("==", 2048))
-
-			sunEmbedding := resp.Data[0].Embedding
-			resp2, err := client.CreateEmbeddings(
-				context.Background(),
-				openai.EmbeddingRequest{
-					Model: openai.AdaEmbeddingV2,
-					Input: []string{"sun"},
-				},
-			)
-			Expect(err).ToNot(HaveOccurred())
-			Expect(resp2.Data[0].Embedding).To(Equal(sunEmbedding))
-		})
-
-		Context("External gRPC calls", func() {
-			It("calculate embeddings with sentencetransformers", func() {
-				if runtime.GOOS != "linux" {
-					Skip("test supported only on linux")
+		// Agent Jobs: HTTP API for task/job scheduling. The underlying AgentPool
+		// service is exercised in core/services/agentpool/agent_jobs_test.go;
+		// these specs cover the /api/agent/* HTTP plumbing on top.
+		Context("Agent Jobs", func() {
+			It("creates and manages tasks", func() {
+				// Create a task
+				taskBody := map[string]any{
+					"name":        "Test Task",
+					"description": "Test Description",
+					"model":       "mock-model",
+					"prompt":      "Hello {{.name}}",
+					"enabled":     true,
 				}
-				resp, err := client.CreateEmbeddings(
-					context.Background(),
-					openai.EmbeddingRequest{
-						Model: openai.AdaCodeSearchCode,
-						Input: []string{"sun", "cat"},
-					},
-				)
-				Expect(err).ToNot(HaveOccurred())
-				Expect(len(resp.Data[0].Embedding)).To(BeNumerically("==", 384))
-				Expect(len(resp.Data[1].Embedding)).To(BeNumerically("==", 384))
 
-				sunEmbedding := resp.Data[0].Embedding
-				resp2, err := client.CreateEmbeddings(
-					context.Background(),
-					openai.EmbeddingRequest{
-						Model: openai.AdaCodeSearchCode,
-						Input: []string{"sun"},
-					},
-				)
+				var createResp map[string]any
+				err := postRequestResponseJSON("http://127.0.0.1:9090/api/agent/tasks", &taskBody, &createResp)
 				Expect(err).ToNot(HaveOccurred())
-				Expect(resp2.Data[0].Embedding).To(Equal(sunEmbedding))
-				Expect(resp2.Data[0].Embedding).ToNot(Equal(resp.Data[1].Embedding))
+				Expect(createResp["id"]).ToNot(BeEmpty())
+				taskID := createResp["id"].(string)
+
+				// Get the task
+				var task schema.Task
+				resp, err := http.Get("http://127.0.0.1:9090/api/agent/tasks/" + taskID)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(resp.StatusCode).To(Equal(200))
+				body, _ := io.ReadAll(resp.Body)
+				json.Unmarshal(body, &task)
+				Expect(task.Name).To(Equal("Test Task"))
+
+				// List tasks
+				resp, err = http.Get("http://127.0.0.1:9090/api/agent/tasks")
+				Expect(err).ToNot(HaveOccurred())
+				Expect(resp.StatusCode).To(Equal(200))
+				var tasks []schema.Task
+				body, _ = io.ReadAll(resp.Body)
+				json.Unmarshal(body, &tasks)
+				Expect(len(tasks)).To(BeNumerically(">=", 1))
+
+				// Update task
+				taskBody["name"] = "Updated Task"
+				err = putRequestJSON("http://127.0.0.1:9090/api/agent/tasks/"+taskID, &taskBody)
+				Expect(err).ToNot(HaveOccurred())
+
+				// Verify update
+				resp, err = http.Get("http://127.0.0.1:9090/api/agent/tasks/" + taskID)
+				Expect(err).ToNot(HaveOccurred())
+				body, _ = io.ReadAll(resp.Body)
+				json.Unmarshal(body, &task)
+				Expect(task.Name).To(Equal("Updated Task"))
+
+				// Delete task
+				req, _ := http.NewRequest("DELETE", "http://127.0.0.1:9090/api/agent/tasks/"+taskID, nil)
+				req.Header.Set("Authorization", bearerKey)
+				resp, err = http.DefaultClient.Do(req)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(resp.StatusCode).To(Equal(200))
 			})
-		})
 
-		// See tests/integration/stores_test
-		Context("Stores", Label("stores"), func() {
-
-			It("sets, gets, finds and deletes entries", func() {
-				ks := [][]float32{
-					{0.1, 0.2, 0.3},
-					{0.4, 0.5, 0.6},
-					{0.7, 0.8, 0.9},
-				}
-				vs := []string{
-					"test1",
-					"test2",
-					"test3",
-				}
-				setBody := schema.StoresSet{
-					Keys:   ks,
-					Values: vs,
+			It("executes and monitors jobs", func() {
+				// Create a task first
+				taskBody := map[string]any{
+					"name":    "Job Test Task",
+					"model":   "mock-model",
+					"prompt":  "Say hello",
+					"enabled": true,
 				}
 
-				url := "http://127.0.0.1:9090/stores/"
-				err := postRequestJSON(url+"set", &setBody)
+				var createResp map[string]any
+				err := postRequestResponseJSON("http://127.0.0.1:9090/api/agent/tasks", &taskBody, &createResp)
+				Expect(err).ToNot(HaveOccurred())
+				taskID := createResp["id"].(string)
+
+				// Execute a job
+				jobBody := map[string]any{
+					"task_id":    taskID,
+					"parameters": map[string]string{},
+				}
+
+				var jobResp schema.JobExecutionResponse
+				err = postRequestResponseJSON("http://127.0.0.1:9090/api/agent/jobs/execute", &jobBody, &jobResp)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(jobResp.JobID).ToNot(BeEmpty())
+				jobID := jobResp.JobID
+
+				// Get job status
+				var job schema.Job
+				resp, err := http.Get("http://127.0.0.1:9090/api/agent/jobs/" + jobID)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(resp.StatusCode).To(Equal(200))
+				body, _ := io.ReadAll(resp.Body)
+				json.Unmarshal(body, &job)
+				Expect(job.ID).To(Equal(jobID))
+				Expect(job.TaskID).To(Equal(taskID))
+
+				// List jobs
+				resp, err = http.Get("http://127.0.0.1:9090/api/agent/jobs")
+				Expect(err).ToNot(HaveOccurred())
+				Expect(resp.StatusCode).To(Equal(200))
+				var jobs []schema.Job
+				body, _ = io.ReadAll(resp.Body)
+				json.Unmarshal(body, &jobs)
+				Expect(len(jobs)).To(BeNumerically(">=", 1))
+
+				// Cancel job (if still pending/running)
+				if job.Status == schema.JobStatusPending || job.Status == schema.JobStatusRunning {
+					req, _ := http.NewRequest("POST", "http://127.0.0.1:9090/api/agent/jobs/"+jobID+"/cancel", nil)
+					req.Header.Set("Authorization", bearerKey)
+					resp, err = http.DefaultClient.Do(req)
+					Expect(err).ToNot(HaveOccurred())
+					Expect(resp.StatusCode).To(Equal(200))
+				}
+			})
+
+			It("executes task by name", func() {
+				// Create a task with a specific name
+				taskBody := map[string]any{
+					"name":    "Named Task",
+					"model":   "mock-model",
+					"prompt":  "Hello",
+					"enabled": true,
+				}
+
+				var createResp map[string]any
+				err := postRequestResponseJSON("http://127.0.0.1:9090/api/agent/tasks", &taskBody, &createResp)
 				Expect(err).ToNot(HaveOccurred())
 
-				getBody := schema.StoresGet{
-					Keys: ks,
-				}
-				var getRespBody schema.StoresGetResponse
-				err = postRequestResponseJSON(url+"get", &getBody, &getRespBody)
+				// Execute by name
+				paramsBody := map[string]string{"param1": "value1"}
+				var jobResp schema.JobExecutionResponse
+				err = postRequestResponseJSON("http://127.0.0.1:9090/api/agent/tasks/Named Task/execute", &paramsBody, &jobResp)
 				Expect(err).ToNot(HaveOccurred())
-				Expect(len(getRespBody.Keys)).To(Equal(len(ks)))
-
-				for i, v := range getRespBody.Keys {
-					if v[0] == 0.1 {
-						Expect(getRespBody.Values[i]).To(Equal("test1"))
-					} else if v[0] == 0.4 {
-						Expect(getRespBody.Values[i]).To(Equal("test2"))
-					} else {
-						Expect(getRespBody.Values[i]).To(Equal("test3"))
-					}
-				}
-
-				deleteBody := schema.StoresDelete{
-					Keys: [][]float32{
-						{0.1, 0.2, 0.3},
-					},
-				}
-				err = postRequestJSON(url+"delete", &deleteBody)
-				Expect(err).ToNot(HaveOccurred())
-
-				findBody := schema.StoresFind{
-					Key:  []float32{0.1, 0.3, 0.7},
-					Topk: 10,
-				}
-
-				var findRespBody schema.StoresFindResponse
-				err = postRequestResponseJSON(url+"find", &findBody, &findRespBody)
-				Expect(err).ToNot(HaveOccurred())
-				Expect(len(findRespBody.Keys)).To(Equal(2))
-
-				for i, v := range findRespBody.Keys {
-					if v[0] == 0.4 {
-						Expect(findRespBody.Values[i]).To(Equal("test2"))
-					} else {
-						Expect(findRespBody.Values[i]).To(Equal("test3"))
-					}
-
-					Expect(findRespBody.Similarities[i]).To(BeNumerically(">=", -1))
-					Expect(findRespBody.Similarities[i]).To(BeNumerically("<=", 1))
-				}
+				Expect(jobResp.JobID).ToNot(BeEmpty())
 			})
 		})
 	})
 
+	// Config file Context: exercises the path where models are loaded from a
+	// single multi-entry YAML (config_file option) rather than per-model YAMLs
+	// in the model dir. The fixtures point at mock-backend so this is a
+	// plumbing test for config-file loading and routing, not a real-inference
+	// test.
 	Context("Config file", func() {
 		BeforeEach(func() {
-			modelPath := os.Getenv("MODELS_PATH")
+			if mockBackendPath == "" {
+				Skip("mock-backend binary not built; run 'make build-mock-backend'")
+			}
 			c, cancel = context.WithCancel(context.Background())
 
 			var err error
+			tmpdir, err = os.MkdirTemp("", "")
+			Expect(err).ToNot(HaveOccurred())
+			modelDir = filepath.Join(tmpdir, "models")
+			Expect(os.Mkdir(modelDir, 0750)).To(Succeed())
+
+			// Inline config file with two list entries that both resolve to mock-backend.
+			// Mirrors the legacy testmodel.ggml shape so the test still proves that
+			// config-file loading registers each entry as a routable model.
+			configContent := `- name: list1
+  parameters:
+    model: mock-model.bin
+  backend: mock-backend
+  context_size: 200
+- name: list2
+  parameters:
+    model: mock-model.bin
+  backend: mock-backend
+  context_size: 200
+`
+			configFile := filepath.Join(tmpdir, "config.yaml")
+			Expect(os.WriteFile(configFile, []byte(configContent), 0644)).To(Succeed())
+
+			systemState, err := system.GetSystemState(
+				system.WithBackendPath(backendDir),
+				system.WithModelPath(modelDir),
+			)
+			Expect(err).ToNot(HaveOccurred())
+
 			application, err := application.New(
 				append(commonOpts,
 					config.WithContext(c),
-					config.WithModelPath(modelPath),
-					config.WithConfigFile(os.Getenv("CONFIG_FILE")))...,
+					config.WithSystemState(systemState),
+					config.WithConfigFile(configFile))...,
 			)
 			Expect(err).ToNot(HaveOccurred())
+			application.ModelLoader().SetExternalBackend("mock-backend", mockBackendPath)
 			app, err = API(application)
 			Expect(err).ToNot(HaveOccurred())
 
-			go app.Listen("127.0.0.1:9090")
+			go func() {
+				if err := app.Start("127.0.0.1:9090"); err != nil && err != http.ErrServerClosed {
+					xlog.Error("server error", "error", err)
+				}
+			}()
 
 			defaultConfig := openai.DefaultConfig("")
 			defaultConfig.BaseURL = "http://127.0.0.1:9090/v1"
@@ -1006,9 +971,12 @@ var _ = Describe("API test", func() {
 		AfterEach(func() {
 			cancel()
 			if app != nil {
-				err := app.Shutdown()
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				err := app.Shutdown(ctx)
 				Expect(err).ToNot(HaveOccurred())
 			}
+			Expect(os.RemoveAll(tmpdir)).To(Succeed())
 		})
 		It("can generate chat completions from config file (list1)", func() {
 			resp, err := client.CreateChatCompletion(context.TODO(), openai.ChatCompletionRequest{Model: "list1", Messages: []openai.ChatCompletionMessage{{Role: "user", Content: testPrompt}}})

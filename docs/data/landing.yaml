@@ -13,7 +13,7 @@ hero:
       mobile: "gradient-mobile.webp"
 
   badge:
-    text: "⭐ 31.8k+ stars on GitHub!"
+    text: "⭐ 33.3k+ stars on GitHub!"
     color: primary
     pill: false
     soft: true
@@ -40,7 +40,7 @@ hero:
   ctaButton:
     icon: rocket_launch
     btnText: "Get Started"
-    url: "/basics/getting_started/"
+    url: "/installation/"
   cta2Button:
     icon: code
     btnText: "View on GitHub"
@@ -163,9 +163,10 @@ imageText:
   weight: 25
   template: image text
 
-  title: Run AI models locally with ease
+  title: LocalAI - Run AI models locally with ease
   subtitle: |
     LocalAI makes it simple to run various AI models on your own hardware. From text generation to image creation, autonomous agents to semantic search - all orchestrated through a unified API.
+    LocalAI, created by **Ettore Di Giacinto (mudler)**,  is a Free and Open Source, community-driven project to make Free, Open AI accessible to everyone. The LocalAI stack is MIT licensed, and the models trained by LocalAI are available under the Apache 2.0 License.
 
   list:
     - text: OpenAI API compatibility
@@ -197,6 +198,9 @@ imageText:
 
     - text: Autonomous agents with [LocalAGI](https://github.com/mudler/LocalAGI)
       icon: smart_toy
+
+    - text: MCP Support [MCP](https://localai.io/docs/features/mcp/)
+      icon: api
 
     - text: Semantic search with [LocalRecall](https://github.com/mudler/LocalRecall)
       icon: psychology

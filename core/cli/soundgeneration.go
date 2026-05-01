@@ -12,7 +12,8 @@ import (
 	cliContext "github.com/mudler/LocalAI/core/cli/context"
 	"github.com/mudler/LocalAI/core/config"
 	"github.com/mudler/LocalAI/pkg/model"
-	"github.com/rs/zerolog/log"
+	"github.com/mudler/LocalAI/pkg/system"
+	"github.com/mudler/xlog"
 )
 
 type SoundGenerationCMD struct {
@@ -27,7 +28,6 @@ type SoundGenerationCMD struct {
 	DoSample               bool     `short:"s" default:"true" help:"Enables sampling from the model. Better quality at the cost of speed. Defaults to enabled."`
 	OutputFile             string   `short:"o" type:"path" help:"The path to write the output wav file"`
 	ModelsPath             string   `env:"LOCALAI_MODELS_PATH,MODELS_PATH" type:"path" default:"${basepath}/models" help:"Path containing models used for inferencing" group:"storage"`
-	BackendAssetsPath      string   `env:"LOCALAI_BACKEND_ASSETS_PATH,BACKEND_ASSETS_PATH" type:"path" default:"/tmp/localai/backend_data" help:"Path used to extract libraries that are required by some of the backends in runtime" group:"storage"`
 	ExternalGRPCBackends   []string `env:"LOCALAI_EXTERNAL_GRPC_BACKENDS,EXTERNAL_GRPC_BACKENDS" help:"A list of external grpc backends" group:"backends"`
 }
 
@@ -51,12 +51,18 @@ func parseToInt32Ptr(input string) *int32 {
 
 func (t *SoundGenerationCMD) Run(ctx *cliContext.Context) error {
 	outputFile := t.OutputFile
-	outputDir := t.BackendAssetsPath
+	outputDir := os.TempDir()
 	if outputFile != "" {
 		outputDir = filepath.Dir(outputFile)
 	}
-
 	text := strings.Join(t.Text, " ")
+
+	systemState, err := system.GetSystemState(
+		system.WithModelPath(t.ModelsPath),
+	)
+	if err != nil {
+		return err
+	}
 
 	externalBackends := make(map[string]string)
 	// split ":" to get backend name and the uri
@@ -64,26 +70,24 @@ func (t *SoundGenerationCMD) Run(ctx *cliContext.Context) error {
 		backend := v[:strings.IndexByte(v, ':')]
 		uri := v[strings.IndexByte(v, ':')+1:]
 		externalBackends[backend] = uri
-		fmt.Printf("TMP externalBackends[%q]=%q\n\n", backend, uri)
 	}
 
 	opts := &config.ApplicationConfig{
-		ModelPath:            t.ModelsPath,
+		SystemState:          systemState,
 		Context:              context.Background(),
 		GeneratedContentDir:  outputDir,
-		AssetsDestination:    t.BackendAssetsPath,
 		ExternalGRPCBackends: externalBackends,
 	}
-	ml := model.NewModelLoader(opts.ModelPath, opts.SingleBackend)
+	ml := model.NewModelLoader(systemState)
 
 	defer func() {
 		err := ml.StopAllGRPC()
 		if err != nil {
-			log.Error().Err(err).Msg("unable to stop all grpc processes")
+			xlog.Error("unable to stop all grpc processes", "error", err)
 		}
 	}()
 
-	options := config.BackendConfig{}
+	options := config.ModelConfig{}
 	options.SetDefaults()
 	options.Backend = t.Backend
 	options.Model = t.Model
@@ -95,7 +99,9 @@ func (t *SoundGenerationCMD) Run(ctx *cliContext.Context) error {
 
 	filePath, _, err := backend.SoundGeneration(text,
 		parseToFloat32Ptr(t.Duration), parseToFloat32Ptr(t.Temperature), &t.DoSample,
-		inputFile, parseToInt32Ptr(t.InputFileSampleDivisor), ml, opts, options)
+		inputFile, parseToInt32Ptr(t.InputFileSampleDivisor),
+		nil, "", "", nil, "", "", "", nil,
+		ml, opts, options)
 
 	if err != nil {
 		return err

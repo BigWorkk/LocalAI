@@ -1,23 +1,29 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 
 	cliContext "github.com/mudler/LocalAI/core/cli/context"
 	"github.com/mudler/LocalAI/core/config"
+	"github.com/mudler/LocalAI/core/services/galleryop"
 
 	"github.com/mudler/LocalAI/core/gallery"
+	"github.com/mudler/LocalAI/core/startup"
 	"github.com/mudler/LocalAI/pkg/downloader"
-	"github.com/mudler/LocalAI/pkg/startup"
-	"github.com/rs/zerolog/log"
+	"github.com/mudler/LocalAI/pkg/model"
+	"github.com/mudler/LocalAI/pkg/system"
+	"github.com/mudler/xlog"
 	"github.com/schollz/progressbar/v3"
 )
 
 type ModelsCMDFlags struct {
-	Galleries  string `env:"LOCALAI_GALLERIES,GALLERIES" help:"JSON list of galleries" group:"models" default:"${galleries}"`
-	ModelsPath string `env:"LOCALAI_MODELS_PATH,MODELS_PATH" type:"path" default:"${basepath}/models" help:"Path containing models used for inferencing" group:"storage"`
+	Galleries        string `env:"LOCALAI_GALLERIES,GALLERIES" help:"JSON list of galleries" group:"models" default:"${galleries}"`
+	BackendGalleries string `env:"LOCALAI_BACKEND_GALLERIES,BACKEND_GALLERIES" help:"JSON list of backend galleries" group:"backends" default:"${backends}"`
+	ModelsPath       string `env:"LOCALAI_MODELS_PATH,MODELS_PATH" type:"path" default:"${basepath}/models" help:"Path containing models used for inferencing" group:"storage"`
+	BackendsPath     string `env:"LOCALAI_BACKENDS_PATH,BACKENDS_PATH" type:"path" default:"${basepath}/backends" help:"Path containing backends used for inferencing" group:"storage"`
 }
 
 type ModelsList struct {
@@ -25,8 +31,9 @@ type ModelsList struct {
 }
 
 type ModelsInstall struct {
-	DisablePredownloadScan bool     `env:"LOCALAI_DISABLE_PREDOWNLOAD_SCAN" help:"If true, disables the best-effort security scanner before downloading any files." group:"hardening" default:"false"`
-	ModelArgs              []string `arg:"" optional:"" name:"models" help:"Model configuration URLs to load"`
+	DisablePredownloadScan   bool     `env:"LOCALAI_DISABLE_PREDOWNLOAD_SCAN" help:"If true, disables the best-effort security scanner before downloading any files." group:"hardening" default:"false"`
+	AutoloadBackendGalleries bool     `env:"LOCALAI_AUTOLOAD_BACKEND_GALLERIES" help:"If true, automatically loads backend galleries" group:"backends" default:"true"`
+	ModelArgs                []string `arg:"" optional:"" name:"models" help:"Model configuration URLs to load"`
 
 	ModelsCMDFlags `embed:""`
 }
@@ -39,10 +46,17 @@ type ModelsCMD struct {
 func (ml *ModelsList) Run(ctx *cliContext.Context) error {
 	var galleries []config.Gallery
 	if err := json.Unmarshal([]byte(ml.Galleries), &galleries); err != nil {
-		log.Error().Err(err).Msg("unable to load galleries")
+		xlog.Error("unable to load galleries", "error", err)
 	}
 
-	models, err := gallery.AvailableGalleryModels(galleries, ml.ModelsPath)
+	systemState, err := system.GetSystemState(
+		system.WithModelPath(ml.ModelsPath),
+		system.WithBackendPath(ml.BackendsPath),
+	)
+	if err != nil {
+		return err
+	}
+	models, err := gallery.AvailableGalleryModels(galleries, systemState)
 	if err != nil {
 		return err
 	}
@@ -57,9 +71,31 @@ func (ml *ModelsList) Run(ctx *cliContext.Context) error {
 }
 
 func (mi *ModelsInstall) Run(ctx *cliContext.Context) error {
+
+	systemState, err := system.GetSystemState(
+		system.WithModelPath(mi.ModelsPath),
+		system.WithBackendPath(mi.BackendsPath),
+	)
+	if err != nil {
+		return err
+	}
+
+	galleryService := galleryop.NewGalleryService(&config.ApplicationConfig{
+		SystemState: systemState,
+	}, model.NewModelLoader(systemState))
+	err = galleryService.Start(context.Background(), config.NewModelConfigLoader(mi.ModelsPath), systemState)
+	if err != nil {
+		return err
+	}
+
 	var galleries []config.Gallery
 	if err := json.Unmarshal([]byte(mi.Galleries), &galleries); err != nil {
-		log.Error().Err(err).Msg("unable to load galleries")
+		xlog.Error("unable to load galleries", "error", err)
+	}
+
+	var backendGalleries []config.Gallery
+	if err := json.Unmarshal([]byte(mi.BackendGalleries), &backendGalleries); err != nil {
+		xlog.Error("unable to load backend galleries", "error", err)
 	}
 
 	for _, modelName := range mi.ModelArgs {
@@ -74,11 +110,11 @@ func (mi *ModelsInstall) Run(ctx *cliContext.Context) error {
 			v := int(percentage * 10)
 			err := progressBar.Set(v)
 			if err != nil {
-				log.Error().Err(err).Str("filename", fileName).Int("value", v).Msg("error while updating progress bar")
+				xlog.Error("error while updating progress bar", "error", err, "filename", fileName, "value", v)
 			}
 		}
 		//startup.InstallModels()
-		models, err := gallery.AvailableGalleryModels(galleries, mi.ModelsPath)
+		models, err := gallery.AvailableGalleryModels(galleries, systemState)
 		if err != nil {
 			return err
 		}
@@ -86,9 +122,9 @@ func (mi *ModelsInstall) Run(ctx *cliContext.Context) error {
 		modelURI := downloader.URI(modelName)
 
 		if !modelURI.LooksLikeOCI() {
-			model := gallery.FindModel(models, modelName, mi.ModelsPath)
+			model := gallery.FindGalleryElement(models, modelName)
 			if model == nil {
-				log.Error().Str("model", modelName).Msg("model not found")
+				xlog.Error("model not found", "model", modelName)
 				return err
 			}
 
@@ -96,11 +132,10 @@ func (mi *ModelsInstall) Run(ctx *cliContext.Context) error {
 			if err != nil && !errors.Is(err, downloader.ErrNonHuggingFaceFile) {
 				return err
 			}
-
-			log.Info().Str("model", modelName).Str("license", model.License).Msg("installing model")
 		}
 
-		err = startup.InstallModels(galleries, mi.ModelsPath, !mi.DisablePredownloadScan, progressCallback, modelName)
+		modelLoader := model.NewModelLoader(systemState)
+		err = startup.InstallModels(context.Background(), galleryService, galleries, backendGalleries, systemState, modelLoader, !mi.DisablePredownloadScan, mi.AutoloadBackendGalleries, progressCallback, modelName)
 		if err != nil {
 			return err
 		}

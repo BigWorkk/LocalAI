@@ -5,7 +5,8 @@ on:
   workflow_dispatch:
 jobs:
   checksum_check:
-    runs-on: arc-runner-set
+    if: github.repository == 'mudler/LocalAI'
+    runs-on: ubuntu-latest
     steps:
       - name: Force Install GIT latest
         run: |
@@ -15,12 +16,11 @@ jobs:
           && sudo add-apt-repository -y ppa:git-core/ppa \
           && sudo apt-get update \
           && sudo apt-get install -y git
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y pip wget
-          sudo pip install --upgrade pip
           pip install huggingface_hub
       - name: 'Setup yq'
         uses: dcarbone/install-yq-action@v1.3.1
@@ -36,7 +36,7 @@ jobs:
           sudo chmod 777 /hf_cache
           bash .github/checksum_checker.sh gallery/index.yaml
       - name: Create Pull Request
-        uses: peter-evans/create-pull-request@v7
+        uses: peter-evans/create-pull-request@v8
         with:
           token: ${{ secrets.UPDATE_BOT_TOKEN }}
           push-to-fork: ci-forks/LocalAI

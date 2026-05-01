@@ -14,6 +14,10 @@ import backend_pb2
 import backend_pb2_grpc
 
 import grpc
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'common'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'common'))
+from grpc_auth import get_auth_interceptors
+
 
 from rerankers import Reranker
 
@@ -61,7 +65,7 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
             if request.PipelineType != "": # Reuse the PipelineType field for language
                 kwargs['lang'] = request.PipelineType
             self.model_name = model_name
-            self.model = Reranker(model_name, **kwargs)  
+            self.model = Reranker(model_name, **kwargs)
         except Exception as err:
             return backend_pb2.Result(success=False, message=f"Unexpected {err=}, {type(err)=}")
 
@@ -75,12 +79,13 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
             documents.append(doc)
         ranked_results=self.model.rank(query=request.query, docs=documents, doc_ids=list(range(len(request.documents))))
         # Prepare results to return
+        cropped_results = ranked_results.top_k(request.top_n) if request.top_n > 0 else ranked_results
         results = [
             backend_pb2.DocumentResult(
                 index=res.doc_id,
                 text=res.text,
                 relevance_score=res.score
-            ) for res in ranked_results.results
+            ) for res in (cropped_results)
         ]
 
         # Calculate the usage and total tokens
@@ -96,7 +101,9 @@ def serve(address):
             ('grpc.max_message_length', 50 * 1024 * 1024),  # 50MB
             ('grpc.max_send_message_length', 50 * 1024 * 1024),  # 50MB
             ('grpc.max_receive_message_length', 50 * 1024 * 1024),  # 50MB
-        ])
+        ],
+        interceptors=get_auth_interceptors(),
+    )
     backend_pb2_grpc.add_BackendServicer_to_server(BackendServicer(), server)
     server.add_insecure_port(address)
     server.start()

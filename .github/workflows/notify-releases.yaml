@@ -6,15 +6,17 @@ on:
 
 jobs:
   notify-discord:
+    if: github.repository == 'mudler/LocalAI'
     runs-on: ubuntu-latest
     env:
         RELEASE_BODY: ${{ github.event.release.body }}
         RELEASE_TITLE: ${{ github.event.release.name }}
         RELEASE_TAG_NAME: ${{ github.event.release.tag_name }}
+        MODEL_NAME: gemma-3-12b-it-qat
     steps:
     - uses: mudler/localai-github-action@v1
       with:
-        model: 'gemma-3-12b-it' # Any from models.localai.io, or from huggingface.com with: "huggingface://<repository>/file"
+        model: 'gemma-3-12b-it-qat' # Any from models.localai.io, or from huggingface.com with: "huggingface://<repository>/file"
     - name: Summarize
       id: summarize
       run: |

@@ -1,12 +1,12 @@
 package localai
 
 import (
-	"github.com/gofiber/fiber/v2"
+	"github.com/labstack/echo/v4"
 	"github.com/mudler/LocalAI/core/backend"
 	"github.com/mudler/LocalAI/core/config"
 	"github.com/mudler/LocalAI/core/http/middleware"
 	"github.com/mudler/LocalAI/core/schema"
-	"github.com/rs/zerolog/log"
+	"github.com/mudler/xlog"
 
 	"github.com/mudler/LocalAI/pkg/model"
 )
@@ -16,42 +16,43 @@ import (
 // TokenMetricsEndpoint is an endpoint to get TokensProcessed Per Second for Active SlotID
 //
 //	@Summary	Get TokenMetrics for Active Slot.
+//	@Tags tokenize
 //	@Accept json
 //	@Produce audio/x-wav
 //	@Success	200		{string}	binary				"generated audio/wav file"
 //	@Router		/v1/tokenMetrics [get]
 //	@Router		/tokenMetrics [get]
-func TokenMetricsEndpoint(cl *config.BackendConfigLoader, ml *model.ModelLoader, appConfig *config.ApplicationConfig) func(c *fiber.Ctx) error {
-	return func(c *fiber.Ctx) error {
+func TokenMetricsEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, appConfig *config.ApplicationConfig) echo.HandlerFunc {
+	return func(c echo.Context) error {
 
 		input := new(schema.TokenMetricsRequest)
 
 		// Get input data from the request body
-		if err := c.BodyParser(input); err != nil {
+		if err := c.Bind(input); err != nil {
 			return err
 		}
 
-		modelFile, ok := c.Locals(middleware.CONTEXT_LOCALS_KEY_MODEL_NAME).(string)
+		modelFile, ok := c.Get(middleware.CONTEXT_LOCALS_KEY_MODEL_NAME).(string)
 		if !ok || modelFile != "" {
 			modelFile = input.Model
-			log.Warn().Msgf("Model not found in context: %s", input.Model)
+			xlog.Warn("Model not found in context", "model", input.Model)
 		}
 
-		cfg, err := cl.LoadBackendConfigFileByNameDefaultOptions(modelFile, appConfig)
+		cfg, err := cl.LoadModelConfigFileByNameDefaultOptions(modelFile, appConfig)
 
 		if err != nil {
-			log.Err(err)
+			xlog.Error("Error loading model config", "error", err)
 			modelFile = input.Model
-			log.Warn().Msgf("Model not found in context: %s", input.Model)
+			xlog.Warn("Model not found in context", "model", input.Model)
 		} else {
 			modelFile = cfg.Model
 		}
-		log.Debug().Msgf("Token Metrics for model: %s", modelFile)
+		xlog.Debug("Token Metrics for model", "model", modelFile)
 
 		response, err := backend.TokenMetrics(modelFile, ml, appConfig, *cfg)
 		if err != nil {
 			return err
 		}
-		return c.JSON(response)
+		return c.JSON(200, response)
 	}
 }

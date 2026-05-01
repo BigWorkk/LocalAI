@@ -1,10 +1,18 @@
-torch==2.4.1
-diffusers
+--extra-index-url https://download.pytorch.org/whl/cu121
+git+https://github.com/huggingface/diffusers
 opencv-python
-# https://github.com/huggingface/transformers/issues/38269#issuecomment-2900214777
-transformers==4.52.1
+transformers
+torchvision
 accelerate
-compel
+git+https://github.com/xhinker/sd_embed
 peft
 sentencepiece
+torch
+ftfy
 optimum-quanto
+# TODO: re-add compel once it supports transformers >= 5.
+# Tracking: https://github.com/damian0815/compel/pull/129
+#           https://github.com/damian0815/compel/issues/128
+# compel currently pins transformers~=4.25, which forced pip into multi-hour
+# resolver backtracking storms in CI. backend.py imports it lazily and gates
+# the COMPEL=1 env var on the import succeeding, so dropping it here is safe.

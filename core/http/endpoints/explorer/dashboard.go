@@ -1,29 +1,34 @@
 package explorer
 
 import (
+	"cmp"
 	"encoding/base64"
-	"sort"
+	"net/http"
+	"slices"
+	"strings"
 
-	"github.com/gofiber/fiber/v2"
+	"github.com/labstack/echo/v4"
 	"github.com/mudler/LocalAI/core/explorer"
-	"github.com/mudler/LocalAI/core/http/utils"
+	"github.com/mudler/LocalAI/core/http/middleware"
 	"github.com/mudler/LocalAI/internal"
 )
 
-func Dashboard() func(*fiber.Ctx) error {
-	return func(c *fiber.Ctx) error {
-		summary := fiber.Map{
+func Dashboard() echo.HandlerFunc {
+	return func(c echo.Context) error {
+		summary := map[string]any{
 			"Title":   "LocalAI API - " + internal.PrintableVersion(),
 			"Version": internal.PrintableVersion(),
-			"BaseURL": utils.BaseURL(c),
+			"BaseURL": middleware.BaseURL(c),
 		}
 
-		if string(c.Context().Request.Header.ContentType()) == "application/json" || len(c.Accepts("html")) == 0 {
+		contentType := c.Request().Header.Get("Content-Type")
+		accept := c.Request().Header.Get("Accept")
+		if strings.Contains(contentType, "application/json") || (accept != "" && !strings.Contains(accept, "html")) {
 			// The client expects a JSON response
-			return c.Status(fiber.StatusOK).JSON(summary)
+			return c.JSON(http.StatusOK, summary)
 		} else {
 			// Render index
-			return c.Render("views/explorer", summary)
+			return c.Render(http.StatusOK, "views/explorer", summary)
 		}
 	}
 }
@@ -39,8 +44,8 @@ type Network struct {
 	Token string `json:"token"`
 }
 
-func ShowNetworks(db *explorer.Database) func(*fiber.Ctx) error {
-	return func(c *fiber.Ctx) error {
+func ShowNetworks(db *explorer.Database) echo.HandlerFunc {
+	return func(c echo.Context) error {
 		results := []Network{}
 		for _, token := range db.TokenList() {
 			networkData, exists := db.Get(token) // get the token data
@@ -57,48 +62,48 @@ func ShowNetworks(db *explorer.Database) func(*fiber.Ctx) error {
 		}
 
 		// order by number of clusters
-		sort.Slice(results, func(i, j int) bool {
-			return len(results[i].Clusters) > len(results[j].Clusters)
+		slices.SortFunc(results, func(a, b Network) int {
+			return cmp.Compare(len(b.Clusters), len(a.Clusters))
 		})
 
-		return c.JSON(results)
+		return c.JSON(http.StatusOK, results)
 	}
 }
 
-func AddNetwork(db *explorer.Database) func(*fiber.Ctx) error {
-	return func(c *fiber.Ctx) error {
+func AddNetwork(db *explorer.Database) echo.HandlerFunc {
+	return func(c echo.Context) error {
 		request := new(AddNetworkRequest)
-		if err := c.BodyParser(request); err != nil {
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Cannot parse JSON"})
+		if err := c.Bind(request); err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]any{"error": "Cannot parse JSON"})
 		}
 
 		if request.Token == "" {
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Token is required"})
+			return c.JSON(http.StatusBadRequest, map[string]any{"error": "Token is required"})
 		}
 
 		if request.Name == "" {
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Name is required"})
+			return c.JSON(http.StatusBadRequest, map[string]any{"error": "Name is required"})
 		}
 
 		if request.Description == "" {
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Description is required"})
+			return c.JSON(http.StatusBadRequest, map[string]any{"error": "Description is required"})
 		}
 
 		// TODO: check if token is valid, otherwise reject
 		// try to decode the token from base64
 		_, err := base64.StdEncoding.DecodeString(request.Token)
 		if err != nil {
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid token"})
+			return c.JSON(http.StatusBadRequest, map[string]any{"error": "Invalid token"})
 		}
 
 		if _, exists := db.Get(request.Token); exists {
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Token already exists"})
+			return c.JSON(http.StatusBadRequest, map[string]any{"error": "Token already exists"})
 		}
 		err = db.Set(request.Token, explorer.TokenData{Name: request.Name, Description: request.Description})
 		if err != nil {
-			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Cannot add token"})
+			return c.JSON(http.StatusInternalServerError, map[string]any{"error": "Cannot add token"})
 		}
 
-		return c.Status(fiber.StatusOK).JSON(fiber.Map{"message": "Token added"})
+		return c.JSON(http.StatusOK, map[string]any{"message": "Token added"})
 	}
 }
