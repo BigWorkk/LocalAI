@@ -449,6 +449,10 @@ func ChatEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, evaluator
 
 		xlog.Debug("Chat endpoint configuration read", "config", config)
 
+		if config.IsMixture() {
+			return handleMixtureRequest(c, cl, ml, evaluator, startupOptions, input, config, id, created, extraUsage)
+		}
+
 		funcs := input.Functions
 		shouldUseFn := len(input.Functions) > 0 && config.ShouldUseFunctions()
 		strictMode := false

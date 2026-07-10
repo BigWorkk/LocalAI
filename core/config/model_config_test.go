@@ -264,4 +264,49 @@ mcp:
 		Expect(err).To(BeNil())
 		Expect(valid).To(BeTrue())
 	})
+	It("Test Validate rejects a mixture with fewer than 2 models", func() {
+		cfg := &ModelConfig{
+			Name:    "combined-ai",
+			Mixture: &MixtureConfig{Models: []string{"a"}, Judge: "a"},
+		}
+		valid, err := cfg.Validate()
+		Expect(valid).To(BeFalse())
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("at least 2 models"))
+	})
+	It("Test Validate rejects a mixture without a judge", func() {
+		cfg := &ModelConfig{
+			Name:    "combined-ai",
+			Mixture: &MixtureConfig{Models: []string{"a", "b"}},
+		}
+		valid, err := cfg.Validate()
+		Expect(valid).To(BeFalse())
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("judge"))
+	})
+	It("Test Validate accepts a well-formed mixture", func() {
+		cfg := &ModelConfig{
+			Name:    "combined-ai",
+			Mixture: &MixtureConfig{Models: []string{"a", "b", "c"}, Judge: "a"},
+		}
+		valid, err := cfg.Validate()
+		Expect(err).To(BeNil())
+		Expect(valid).To(BeTrue())
+	})
+	It("Test IsMixture and chat usecase detection for mixture configs", func() {
+		cfg := &ModelConfig{
+			Name:    "combined-ai",
+			Mixture: &MixtureConfig{Models: []string{"a", "b"}, Judge: "a"},
+		}
+		Expect(cfg.IsMixture()).To(BeTrue())
+		// No template is set, and it isn't a mixture, so a plain config
+		// would fail the chat usecase heuristic - but mixtures are
+		// chat-capable by construction since they don't render a template
+		// themselves.
+		Expect(cfg.HasUsecases(FLAG_CHAT)).To(BeTrue())
+
+		plain := &ModelConfig{Name: "plain"}
+		Expect(plain.IsMixture()).To(BeFalse())
+		Expect(plain.HasUsecases(FLAG_CHAT)).To(BeFalse())
+	})
 })
