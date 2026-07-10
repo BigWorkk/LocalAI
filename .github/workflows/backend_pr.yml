@@ -24,7 +24,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bun add js-yaml
+          bun add js-yaml@^4
           bun add @octokit/core
 
       # filters the matrix in backend.yml
