@@ -15,14 +15,17 @@ Create a model config file (e.g. `models/combined-ai.yaml`) with a `mixture` blo
 name: combined-ai
 mixture:
   models:
-    - llama-3.2-instruct
-    - qwen3-instruct
-    - mistral-instruct
-  judge: llama-3.2-instruct
+    - kimi-k2.6
+    - qwen3.6-35b-a3b
+    - deepseek-ai.deepseek-v3.2
+    - glm-4.7-flash
+  judge: kimi-k2.6
 ```
 
-- `mixture.models`: the model names to fan the request out to (at least 2, each must already be a working model config on this instance).
+- `mixture.models`: the model names to fan the request out to (at least 2, each must already be a working model config on this instance — install them from the gallery first, e.g. `local-ai run kimi-k2.6`).
 - `mixture.judge`: the model name asked to pick the best candidate answer. It may also be one of `mixture.models`.
+
+The example above intentionally lists flagship-tier open-weight models (as of writing, the strongest generalist models in the gallery) — the point of a mixture is to pool your best available models, not general-purpose filler ones. Swap in whichever top models are current and installed on your instance; the judge doesn't need to be the single strongest model, just one that reliably follows the "reply with only a number" instruction.
 
 Call it exactly like any other model:
 

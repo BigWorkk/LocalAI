@@ -290,7 +290,9 @@ func handleMixtureRequest(c echo.Context, cl *config.ModelConfigLoader, ml *mode
 		return err
 	}
 
-	fmt.Fprintf(c.Response().Writer, "data: [DONE]\n\n")
+	if _, err := fmt.Fprintf(c.Response().Writer, "data: [DONE]\n\n"); err != nil {
+		return err
+	}
 	c.Response().Flush()
 	return nil
 }
