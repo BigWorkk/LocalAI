@@ -25,6 +25,13 @@ type mixtureCandidate struct {
 	Response string
 }
 
+func accumulateMixtureUsage(total *backend.TokenUsage, usage backend.TokenUsage) {
+	total.Prompt += usage.Prompt
+	total.Completion += usage.Completion
+	total.TimingPromptProcessing += usage.TimingPromptProcessing
+	total.TimingTokenGeneration += usage.TimingTokenGeneration
+}
+
 // lastUserMessageContent returns the plain text of the most recent user
 // message, used as the question shown to the judge model.
 func lastUserMessageContent(messages []schema.Message) string {
@@ -102,8 +109,7 @@ func runMixtureCandidates(ctx context.Context, input *schema.OpenAIRequest, mode
 				return
 			}
 			mu.Lock()
-			totalUsage.Prompt += usage.Prompt
-			totalUsage.Completion += usage.Completion
+			accumulateMixtureUsage(&totalUsage, usage)
 			mu.Unlock()
 		}(i, modelName)
 	}
@@ -214,8 +220,7 @@ func handleMixtureRequest(c echo.Context, cl *config.ModelConfigLoader, ml *mode
 	if err != nil {
 		xlog.Warn("mixture judge failed, falling back to first candidate", "error", err)
 	}
-	usage.Prompt += judgeUsage.Prompt
-	usage.Completion += judgeUsage.Completion
+	accumulateMixtureUsage(&usage, judgeUsage)
 
 	xlog.Debug("mixture request served", "model", cfg.Name, "chosen", chosen.Model, "candidates", len(candidates))
 

@@ -1,12 +1,38 @@
 package openai
 
 import (
+	"github.com/mudler/LocalAI/core/backend"
 	"github.com/mudler/LocalAI/core/schema"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
 
 var _ = Describe("Mixture of models helpers", func() {
+	Context("accumulateMixtureUsage", func() {
+		It("sums token counts and timings across member and judge calls", func() {
+			var total backend.TokenUsage
+			accumulateMixtureUsage(&total, backend.TokenUsage{
+				Prompt:                 10,
+				Completion:             20,
+				TimingPromptProcessing: 1.5,
+				TimingTokenGeneration:  2.5,
+			})
+			accumulateMixtureUsage(&total, backend.TokenUsage{
+				Prompt:                 30,
+				Completion:             40,
+				TimingPromptProcessing: 3.5,
+				TimingTokenGeneration:  4.5,
+			})
+
+			Expect(total).To(Equal(backend.TokenUsage{
+				Prompt:                 40,
+				Completion:             60,
+				TimingPromptProcessing: 5,
+				TimingTokenGeneration:  7,
+			}))
+		})
+	})
+
 	Context("parseJudgeChoice", func() {
 		It("parses a plain number", func() {
 			Expect(parseJudgeChoice("2", 3)).To(Equal(2))
