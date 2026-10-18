@@ -92,6 +92,27 @@ type ModelConfig struct {
 
 	MCP   MCPConfig   `yaml:"mcp,omitempty" json:"mcp,omitempty"`
 	Agent AgentConfig `yaml:"agent,omitempty" json:"agent,omitempty"`
+
+	// Mixture, when set, turns this config into a virtual model: chat requests
+	// are fanned out to Models, and Judge picks the single best answer to return.
+	Mixture *MixtureConfig `yaml:"mixture,omitempty" json:"mixture,omitempty"`
+}
+
+// @Description Mixture-of-models configuration: fan a chat request out to
+// several models and have a judge model pick the single best answer.
+type MixtureConfig struct {
+	// Models is the list of model names to fan the request out to concurrently.
+	Models []string `yaml:"models,omitempty" json:"models,omitempty"`
+
+	// Judge is the model name asked to pick the best of the candidate answers.
+	// It may also appear in Models.
+	Judge string `yaml:"judge,omitempty" json:"judge,omitempty"`
+}
+
+// IsMixture reports whether this config fans requests out to multiple models
+// and picks the best answer via a judge model, rather than running inference itself.
+func (c *ModelConfig) IsMixture() bool {
+	return c.Mixture != nil && len(c.Mixture.Models) > 0
 }
 
 // @Description MCP configuration
@@ -552,6 +573,16 @@ func (c *ModelConfig) Validate() (bool, error) {
 		}
 	}
 
+	// Validate mixture configuration if present
+	if c.Mixture != nil {
+		if len(c.Mixture.Models) < 2 {
+			return false, fmt.Errorf("mixture requires at least 2 models, got %d", len(c.Mixture.Models))
+		}
+		if c.Mixture.Judge == "" {
+			return false, fmt.Errorf("mixture requires a judge model")
+		}
+	}
+
 	// engine_args crosses the gRPC boundary as a JSON-encoded string. Reject
 	// unmarshalable values here so a config that would silently lose user-set
 	// options at load time is rejected at parse time instead.
@@ -675,7 +706,9 @@ func (c *ModelConfig) GuessUsecases(u ModelConfigUsecase) bool {
 		"transformers-musicgen", "ace-step", "acestep-cpp",
 	}
 
-	if (u & FLAG_CHAT) == FLAG_CHAT {
+	// Mixture configs don't render a template themselves: the request is fanned
+	// out to their member models, each templated with its own config.
+	if (u&FLAG_CHAT) == FLAG_CHAT && !c.IsMixture() {
 		if c.TemplateConfig.Chat == "" && c.TemplateConfig.ChatMessage == "" && !c.TemplateConfig.UseTokenizerTemplate {
 			return false
 		}
