@@ -42,6 +42,7 @@ import NotFound from './pages/NotFound'
 import Usage from './pages/Usage'
 import Users from './pages/Users'
 import Account from './pages/Account'
+import Wingman from './pages/Wingman'
 import RequireAdmin from './components/RequireAdmin'
 import RequireAuth from './components/RequireAuth'
 import RequireFeature from './components/RequireFeature'
@@ -75,6 +76,8 @@ const appChildren = [
   { path: 'sound/:model', element: <Sound /> },
   { path: 'studio', element: <Studio /> },
   { path: 'talk', element: <Talk /> },
+  { path: 'wingman', element: <Wingman /> },
+  { path: 'wingman/:screen', element: <Wingman /> },
   { path: 'face', element: <Feature feature="face_recognition"><FaceRecognition /></Feature> },
   { path: 'face/:model', element: <Feature feature="face_recognition"><FaceRecognition /></Feature> },
   { path: 'voice', element: <Feature feature="voice_recognition"><VoiceRecognition /></Feature> },
