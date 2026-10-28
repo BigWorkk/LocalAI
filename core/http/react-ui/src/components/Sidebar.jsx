@@ -13,6 +13,7 @@ const topItems = [
   { path: '/app/chat', icon: 'fas fa-comments', label: 'Chat' },
   { path: '/app/studio', icon: 'fas fa-palette', label: 'Studio' },
   { path: '/app/talk', icon: 'fas fa-phone', label: 'Talk' },
+  { path: '/app/wingman', icon: 'fas fa-gamepad', label: 'Wingman' },
 ]
 
 const sections = [
